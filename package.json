@@ -1,0 +1,19 @@
+{
+  "name": "pocketscout",
+  "version": "1.0.0",
+  "description": "AI-powered SMS deal finder for Canadians",
+  "main": "pocketscout-server.js",
+  "scripts": {
+    "start": "node pocketscout-server.js",
+    "dev": "nodemon pocketscout-server.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "twilio": "^5.3.4"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.3"
+  }
+}

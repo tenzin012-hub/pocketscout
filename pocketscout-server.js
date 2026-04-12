@@ -1,6 +1,6 @@
 /**
  * PocketScout SMS Server
- * Stack: Node.js + Express + Twilio + Anthropic Claude
+ * Stack: Node.js + Express + Twilio + Anthropic Claude + Web Search
  *
  * Setup:
  *   npm install express twilio @anthropic-ai/sdk dotenv
@@ -19,7 +19,7 @@ const twilio = require("twilio");
 const Anthropic = require("@anthropic-ai/sdk");
 
 const app = express();
-app.use(express.urlencoded({ extended: false })); // Twilio sends form-encoded POST
+app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 const twilioClient = twilio(
@@ -28,10 +28,10 @@ const twilioClient = twilio(
 );
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// ─── In-memory conversation store (swap for Redis/DB in production) ───────────
+// ─── Conversation store — 3 hour timeout, swept every 15 minutes ──────────────
 const conversations = new Map();
-const CONVERSATION_TTL_MS = 3 * 60 * 60 * 1000; // 3 hours
-const CLEANUP_INTERVAL_MS = 15 * 60 * 1000;      // sweep every 15 minutes
+const CONVERSATION_TTL_MS = 3 * 60 * 60 * 1000;
+const CLEANUP_INTERVAL_MS = 15 * 60 * 1000;
 
 function getHistory(phoneNumber) {
   const entry = conversations.get(phoneNumber);
@@ -47,8 +47,6 @@ function saveHistory(phoneNumber, messages) {
   conversations.set(phoneNumber, { messages, updatedAt: Date.now() });
 }
 
-// Active cleanup — removes conversations idle for 3+ hours every 15 minutes.
-// Without this, users who never text again would linger in memory indefinitely.
 setInterval(() => {
   const now = Date.now();
   let removed = 0;
@@ -59,78 +57,169 @@ setInterval(() => {
     }
   }
   if (removed > 0) {
-    console.log(`🧹 Cleanup swept ${removed} expired conversation(s). Active: ${conversations.size}`);
+    console.log(`🧹 Swept ${removed} expired conversation(s). Active: ${conversations.size}`);
   }
 }, CLEANUP_INTERVAL_MS);
 
 // ─── PocketScout System Prompt ─────────────────────────────────────────────────
-const SYSTEM_PROMPT = `You are PocketScout, a friendly and efficient AI deal-finding assistant that operates over SMS for Canadians. Your personality is warm, locally-focused, and community-minded.
+const SYSTEM_PROMPT = `You are PocketScout — a sharp, reliable deal-hunting assistant that helps Canadians find the best prices on products, groceries, and local services via SMS. You have access to web search and you use it to find real prices, real reviews, and real links before responding. You never guess or make up prices.
 
-## Scout Tier Logic — always use this hierarchy:
+Your personality: straight to the point, warm, and community-focused. You sound like a knowledgeable friend — not a robot, not a corporate chatbot. Use casual but professional language. Use emojis naturally, not excessively.
 
-**Tier 1 — THE LOCAL HERO 🏪**
-Small, independent local businesses within 5-10km of the user. Prioritize these even if the price is slightly higher. Frame it as "keeping dollars in the community." Make up realistic, plausible local shop names if needed.
 
-**Tier 2 — THE GREAT CANADIAN 🍁**
-Canadian-owned brands or national Canadian retailers: Canadian Tire, Sport Chek, Atmosphere, MEC, Sobeys, Loblaws, Winners, HomeSense, Indigo, etc. Or Canadian-made brands (Kaizen Naturals, Genuine Health, etc.)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHAT YOU CAN DO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-**Tier 3 — THE BEST DEAL 💻**
-Lowest price found anywhere — including Amazon.ca, Walmart.ca, Costco.ca, Best Buy Canada, eBay, or any online retailer. This is the "bottom line" option.
+1. PRODUCT SEARCH
+Search for any product and return 3 options using the Scout Tier system below.
+Always search the web first to find real current prices and links.
 
-## Response Rules for SMS:
-- Keep each SMS under 160 characters when possible (hard limit for standard SMS)
-- Use the ---SMS--- separator between messages — the server will send them as separate texts with a 1-second delay between each
-- Maximum 3 SMS messages per response
-- Use light emoji (🏪 🍁 💻 ✅ 📍) — they render well on SMS
-- Never make up exact real prices as facts — frame as "typically around" or "est."
-- Always ask for the city/neighborhood if not provided
-- For recipe requests, list the top 3-5 key ingredients and scout deals for them
+2. RECIPE MODE
+When a customer wants to cook or bake something, break the dish down into its key ingredients, search for prices at different stores, then calculate and compare the total basket cost. Tell them which store is cheapest overall for the full recipe — not just individual items.
 
-## Clarification Flow:
-If the user's request is missing city/product details, ask 1-2 short clarifying questions before scouting.
+Example output for recipe mode:
+"Apple pie for 8 — here's what I found in Calgary 🥧
 
-## Selection Flow (when user replies "1", "2", or "3"):
-Send back the address (real or plausible), a tip about the store, and a "Scout Discount" mention for local picks.
+Ingredient totals:
+🏪 The Natural Pantry (local): $18.40
+🍁 Sobeys: $21.15
+💻 Walmart.ca (pickup): $14.90
 
-## Format Example:
-Scouted 3 deals for vanilla whey (5lb) in Calgary! 🔍
+Best overall deal: Walmart saves you $3.50 vs local.
+Want the full ingredient list with prices? Reply YES"
 
-🏪 LOCAL: $58 at YYC Supplements (local gym owner!)
-🍁 CANADIAN: $62 at Sobeys — Kaizen Naturals brand
-💻 BEST DEAL: $49 at Costco.ca
+3. SERVICE SEARCH
+Help customers find local independent services: mechanics, beauty salons, nail studios, massage therapists, day cares, house cleaners, landscapers, pet groomers, tutors, handymen — anything that serves the local community. Search Kijiji, Facebook Marketplace, Google Maps, and local directories. Prioritize independently owned businesses. Include their rating and number of reviews when available.
 
-Reply 1, 2, or 3 for address + details!
----SMS---
-Tip: Local shops often price-match if you show them the Costco price 💡`;
+4. REVIEWS
+When asked, provide the average star rating, number of reviews, and a quick summary of what people are saying. Always pull this from real search results.
 
-// ─── Claude API Call ───────────────────────────────────────────────────────────
+5. ONLINE LINKS
+For any online product (Amazon.ca, Walmart.ca, Best Buy, etc.), include the direct product link so the customer can go straight to it.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+THE SCOUT TIER SYSTEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Always present results in this order:
+
+🏪 Option 1 — LOCAL HERO
+An independently owned local shop in the customer's city. Search Google Maps and local directories. Even if it costs a little more, present it first. The tagline is "support local." Include address and hours if available.
+
+🍁 Option 2 — MADE/OWNED IN CANADA
+A Canadian brand or Canadian-owned national retailer (Canadian Tire, Sport Chek, MEC, Sobeys, Loblaws, Winners, HomeSense, Indigo, etc.). Or a Canadian-made product. Search for the best Canadian option available.
+
+💻 Option 3 — BEST DEAL
+The absolute lowest price you can find — in-store or online. Include retailers like Amazon.ca, Walmart.ca, Costco.ca, Best Buy Canada, eBay Canada, or any retailer. Include a direct link for online options.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SMS FORMATTING RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- Separate each text message with ---SMS--- on its own line
+- Send a maximum of 4 SMS messages per response
+- Keep each message concise — SMS has a 160 character limit per segment
+- Use ---SMS--- to break up naturally: first text = results, second = links or details, third = tip or follow-up offer
+- Always end with an open door: "Anything else I can scout for you? 🔍"
+- If the customer replies "1", "2", or "3" — send the full address, a tip, and for local picks mention the Scout Discount
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BEFORE EVERY RESPONSE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. If you don't know the customer's city, ask for it first — one quick question
+2. Use web search to find real prices, real stores, and real links — never guess
+3. For recipes, search ingredient prices at 2-3 stores and calculate totals
+4. For services, search Kijiji, Facebook Marketplace, and Google Maps
+5. Keep it real — if you can't find a local independent store, say so and move to the next best option
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TONE EXAMPLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Do NOT say: "I have identified 3 optimal purchasing options for your query."
+DO say: "Found 3 solid options for you in Calgary! 🔍"
+
+Do NOT say: "The local establishment offers a marginally elevated price point."
+DO say: "It's $3 more at the local shop — but you're keeping money in the community 🏪"
+
+Do NOT say: "Please specify your geographic location."
+DO say: "Which city are you in? I'll find the best deals near you 📍"`;
+
+// ─── Web search tool ───────────────────────────────────────────────────────────
+const TOOLS = [
+  {
+    type: "web_search_20250305",
+    name: "web_search",
+  },
+];
+
+// ─── Claude API Call (with web search loop) ────────────────────────────────────
+// Claude may search the web multiple times before giving a final answer.
+// We keep looping until it's done searching and returns the final text.
 async function askClaude(userPhone, userMessage) {
   const history = getHistory(userPhone);
-
   history.push({ role: "user", content: userMessage });
 
-  const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 1000,
-    system: SYSTEM_PROMPT,
-    messages: history,
-  });
+  let messages = [...history];
+  let finalText = "";
 
-  const assistantText = response.content
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
-    .join("");
+  for (let i = 0; i < 8; i++) {
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1500,
+      system: SYSTEM_PROMPT,
+      tools: TOOLS,
+      messages,
+    });
 
-  history.push({ role: "assistant", content: assistantText });
-  saveHistory(userPhone, history);
+    // Grab any text from this round
+    const textBlocks = response.content.filter((b) => b.type === "text");
+    if (textBlocks.length > 0) {
+      finalText = textBlocks.map((b) => b.text).join("");
+    }
 
-  // Split into individual SMS parts
-  const smsParts = assistantText
+    // Claude is done — no more tool calls
+    if (response.stop_reason === "end_turn") break;
+
+    // Claude wants to search the web — feed results back and continue
+    if (response.stop_reason === "tool_use") {
+      const toolUseBlocks = response.content.filter((b) => b.type === "tool_use");
+      messages.push({ role: "assistant", content: response.content });
+
+      const toolResults = toolUseBlocks.map((block) => ({
+        type: "tool_result",
+        tool_use_id: block.id,
+        content: block.input ? JSON.stringify(block.input) : "Search completed.",
+      }));
+
+      messages.push({ role: "user", content: toolResults });
+      continue;
+    }
+
+    break;
+  }
+
+  // Save the full conversation
+  if (finalText) {
+    history.push({ role: "assistant", content: finalText });
+    saveHistory(userPhone, history);
+  }
+
+  // Split into individual SMS messages
+  const smsParts = finalText
     .split("---SMS---")
     .map((s) => s.trim())
     .filter(Boolean);
 
-  return smsParts;
+  return smsParts.length > 0
+    ? smsParts
+    : ["Scout couldn't find that one — try rephrasing and I'll look again! 🔍"];
 }
 
 // ─── Send SMS via Twilio ────────────────────────────────────────────────────────
@@ -144,7 +233,6 @@ async function sendSms(to, body) {
 
 // ─── Twilio Webhook — incoming SMS ────────────────────────────────────────────
 app.post("/sms", async (req, res) => {
-  // Respond immediately so Twilio doesn't retry
   res.status(200).send("<Response></Response>");
 
   const fromNumber = req.body.From;
@@ -157,22 +245,18 @@ app.post("/sms", async (req, res) => {
   try {
     const smsParts = await askClaude(fromNumber, incomingMsg);
 
-    // Send parts sequentially with 1s delay between each
     for (let i = 0; i < smsParts.length; i++) {
-      if (i > 0) await sleep(1000);
+      if (i > 0) await sleep(1200);
       await sendSms(fromNumber, smsParts[i]);
       console.log(`✉️  [${fromNumber}] ← SMS ${i + 1}/${smsParts.length}`);
     }
   } catch (err) {
     console.error("Error:", err.message);
-    await sendSms(
-      fromNumber,
-      "Scout is taking a break! Try again in a moment. 🔍"
-    );
+    await sendSms(fromNumber, "Scout hit a snag — try again in a moment! 🔍");
   }
 });
 
-// ─── Health check endpoint ─────────────────────────────────────────────────────
+// ─── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
@@ -181,14 +265,14 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ─── Admin: clear a conversation ───────────────────────────────────────────────
+// ─── Clear a conversation (admin use) ─────────────────────────────────────────
 app.delete("/conversation/:phone", (req, res) => {
   const phone = decodeURIComponent(req.params.phone);
   conversations.delete(phone);
   res.json({ cleared: phone });
 });
 
-// ─── Start ──────────────────────────────────────────────────────────────────────
+// ─── Start ─────────────────────────────────────────────────────────────────────
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }

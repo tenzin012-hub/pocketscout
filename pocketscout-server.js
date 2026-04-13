@@ -120,11 +120,10 @@ SMS FORMATTING RULES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 - Separate each text message with ---SMS--- on its own line
-- Do not use emoji
 - Send a maximum of 4 SMS messages per response
 - Keep each message concise — SMS has a 160 character limit per segment
 - Use ---SMS--- to break up naturally: first text = results, second = links or details, third = tip or follow-up offer
-- Always end with an open door: "Anything else I can scout for you? "
+- Always end with an open door: "Anything else I can scout for you? 🔍"
 - If the customer replies "1", "2", or "3" — send the full address, a tip, and for local picks mention the Scout Discount
 
 
@@ -174,6 +173,30 @@ const TOOLS = [
   },
 ];
 
+// ─── Retry helper — waits and retries on 529 Overloaded errors ───────────────
+// When Anthropic gets too many requests at once it returns a 529.
+// Instead of failing immediately we wait a few seconds and try again,
+// up to 5 attempts with increasing wait times (2s, 4s, 8s, 16s, 32s).
+async function callClaudeWithRetry(params, attempt = 1) {
+  const MAX_ATTEMPTS = 5;
+  try {
+    return await anthropic.messages.create(params);
+  } catch (err) {
+    const isOverloaded =
+      err.status === 529 ||
+      (err.message && err.message.includes("overloaded"));
+
+    if (isOverloaded && attempt <= MAX_ATTEMPTS) {
+      const waitMs = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s, 16s, 32s
+      console.log(`⏳ Anthropic overloaded — retrying in ${waitMs / 1000}s (attempt ${attempt}/${MAX_ATTEMPTS})`);
+      await sleep(waitMs);
+      return callClaudeWithRetry(params, attempt + 1);
+    }
+
+    throw err; // give up after max attempts or non-529 error
+  }
+}
+
 // ─── Claude API Call (with web search loop) ────────────────────────────────────
 // Claude may search the web multiple times before giving a final answer.
 // We keep looping until it's done searching and returns the final text.
@@ -185,7 +208,7 @@ async function askClaude(userPhone, userMessage) {
   let finalText = "";
 
   for (let i = 0; i < 8; i++) {
-    const response = await anthropic.messages.create({
+    const response = await callClaudeWithRetry({
       model: "claude-sonnet-4-20250514",
       max_tokens: 1500,
       system: SYSTEM_PROMPT,
@@ -299,7 +322,7 @@ app.listen(PORT, () => {
   console.log(`
   ╔══════════════════════════════════╗
   ║  🔍 PocketScout SMS Server       ║
-  ║  Listening on port ${PORT}       ║
+  ║  Listening on port ${PORT}          ║
   ║  POST /sms  → Twilio webhook     ║
   ║  GET  /health → status check     ║
   ╚══════════════════════════════════╝

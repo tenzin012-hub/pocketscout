@@ -50,7 +50,11 @@ function getHistory(phone) {
     conversations.delete(phone);
     return [];
   }
-  return entry.messages;
+  // Keep only the last 10 messages per user (5 exchanges).
+  // Each web search adds tokens fast — trimming old history keeps us
+  // well under the 30,000 tokens/minute rate limit.
+  const messages = entry.messages;
+  return messages.length > 10 ? messages.slice(-10) : messages;
 }
 
 function saveHistory(phone, messages) {
@@ -244,9 +248,9 @@ const TOOLS = [
   },
 ];
 
-// ─── Retry helper — waits and retries on 529 Overloaded ───────────────────────
+// ─── Retry helper — handles 529 Overloaded AND 429 Rate Limit ────────────────
 async function callClaudeWithRetry(params, attempt = 1) {
-  const MAX_ATTEMPTS = 5;
+  const MAX_ATTEMPTS = 6;
   try {
     return await anthropic.messages.create(params);
   } catch (err) {
@@ -254,9 +258,16 @@ async function callClaudeWithRetry(params, attempt = 1) {
       err.status === 529 ||
       (err.message && err.message.includes("overloaded"));
 
-    if (isOverloaded && attempt <= MAX_ATTEMPTS) {
-      const waitMs = Math.pow(2, attempt) * 1000;
-      console.log(`⏳ Overloaded — retrying in ${waitMs / 1000}s (attempt ${attempt}/${MAX_ATTEMPTS})`);
+    const isRateLimited =
+      err.status === 429 ||
+      (err.message && err.message.includes("rate_limit"));
+
+    if ((isOverloaded || isRateLimited) && attempt <= MAX_ATTEMPTS) {
+      // Rate limit needs a longer wait than overload — give it 15s minimum
+      const baseWait = isRateLimited ? 15000 : 2000;
+      const waitMs = baseWait * attempt;
+      const reason = isRateLimited ? "Rate limited" : "Overloaded";
+      console.log(`⏳ ${reason} — retrying in ${waitMs / 1000}s (attempt ${attempt}/${MAX_ATTEMPTS})`);
       await sleep(waitMs);
       return callClaudeWithRetry(params, attempt + 1);
     }

@@ -1,6 +1,13 @@
 /**
- * PocketScout SMS Server
+ * PocketScout SMS Server — Booth Edition
  * Stack: Node.js + Express + Twilio + Anthropic Claude + Web Search
+ *
+ * Hardened for high traffic:
+ *  - Per-user message queue     → no crossed conversations
+ *  - Duplicate message filter   → Twilio retries are ignored
+ *  - Concurrency limiter        → max 5 AI calls at once, rest wait in line
+ *  - Auto retry on 529          → recovers from Anthropic overload silently
+ *  - "Please wait" reply        → user knows Scout received their text
  *
  * Setup:
  *   npm install express twilio @anthropic-ai/sdk dotenv
@@ -28,23 +35,26 @@ const twilioClient = twilio(
 );
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// ─── Conversation store — 3 hour timeout, swept every 15 minutes ──────────────
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ─── Conversation store — 3 hour TTL, swept every 15 min ──────────────────────
 const conversations = new Map();
 const CONVERSATION_TTL_MS = 3 * 60 * 60 * 1000;
-const CLEANUP_INTERVAL_MS = 15 * 60 * 1000;
 
-function getHistory(phoneNumber) {
-  const entry = conversations.get(phoneNumber);
+function getHistory(phone) {
+  const entry = conversations.get(phone);
   if (!entry) return [];
   if (Date.now() - entry.updatedAt > CONVERSATION_TTL_MS) {
-    conversations.delete(phoneNumber);
+    conversations.delete(phone);
     return [];
   }
   return entry.messages;
 }
 
-function saveHistory(phoneNumber, messages) {
-  conversations.set(phoneNumber, { messages, updatedAt: Date.now() });
+function saveHistory(phone, messages) {
+  conversations.set(phone, { messages, updatedAt: Date.now() });
 }
 
 setInterval(() => {
@@ -59,7 +69,68 @@ setInterval(() => {
   if (removed > 0) {
     console.log(`🧹 Swept ${removed} expired conversation(s). Active: ${conversations.size}`);
   }
-}, CLEANUP_INTERVAL_MS);
+}, 15 * 60 * 1000);
+
+// ─── Duplicate message filter ──────────────────────────────────────────────────
+// Twilio resends a webhook if your server is slow to respond.
+// We track the last 200 message IDs and ignore any we've already processed.
+const processedMessageIds = new Set();
+const MESSAGE_ID_LIMIT = 200;
+
+function isDuplicate(messageSid) {
+  if (!messageSid) return false;
+  if (processedMessageIds.has(messageSid)) return true;
+  processedMessageIds.add(messageSid);
+  if (processedMessageIds.size > MESSAGE_ID_LIMIT) {
+    const firstKey = processedMessageIds.values().next().value;
+    processedMessageIds.delete(firstKey);
+  }
+  return false;
+}
+
+// ─── Per-user message queue ────────────────────────────────────────────────────
+// If the same person texts twice quickly, the second message waits for the
+// first one to finish. This prevents crossed or out-of-order conversations.
+const userQueues = new Map();
+
+function enqueueForUser(phone, task) {
+  if (!userQueues.has(phone)) {
+    userQueues.set(phone, Promise.resolve());
+  }
+  const queue = userQueues.get(phone).then(task).catch(() => {});
+  userQueues.set(phone, queue);
+  queue.finally(() => {
+    if (userQueues.get(phone) === queue) userQueues.delete(phone);
+  });
+}
+
+// ─── Global concurrency limiter ────────────────────────────────────────────────
+// Limits how many AI calls run at the same time.
+// At a busy booth with 20 people texting at once, this keeps Anthropic
+// from getting hammered and triggering 529 errors.
+const MAX_CONCURRENT = 5;
+let activeCount = 0;
+const waitingQueue = [];
+
+function acquireSlot() {
+  return new Promise((resolve) => {
+    if (activeCount < MAX_CONCURRENT) {
+      activeCount++;
+      resolve();
+    } else {
+      waitingQueue.push(resolve);
+    }
+  });
+}
+
+function releaseSlot() {
+  if (waitingQueue.length > 0) {
+    const next = waitingQueue.shift();
+    next();
+  } else {
+    activeCount--;
+  }
+}
 
 // ─── PocketScout System Prompt ─────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are PocketScout — a sharp, reliable deal-hunting assistant that helps Canadians find the best prices on products, groceries, and local services via SMS. You have access to web search and you use it to find real prices, real reviews, and real links before responding. You never guess or make up prices.
@@ -173,10 +244,7 @@ const TOOLS = [
   },
 ];
 
-// ─── Retry helper — waits and retries on 529 Overloaded errors ───────────────
-// When Anthropic gets too many requests at once it returns a 529.
-// Instead of failing immediately we wait a few seconds and try again,
-// up to 5 attempts with increasing wait times (2s, 4s, 8s, 16s, 32s).
+// ─── Retry helper — waits and retries on 529 Overloaded ───────────────────────
 async function callClaudeWithRetry(params, attempt = 1) {
   const MAX_ATTEMPTS = 5;
   try {
@@ -187,21 +255,18 @@ async function callClaudeWithRetry(params, attempt = 1) {
       (err.message && err.message.includes("overloaded"));
 
     if (isOverloaded && attempt <= MAX_ATTEMPTS) {
-      const waitMs = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s, 16s, 32s
-      console.log(`⏳ Anthropic overloaded — retrying in ${waitMs / 1000}s (attempt ${attempt}/${MAX_ATTEMPTS})`);
+      const waitMs = Math.pow(2, attempt) * 1000;
+      console.log(`⏳ Overloaded — retrying in ${waitMs / 1000}s (attempt ${attempt}/${MAX_ATTEMPTS})`);
       await sleep(waitMs);
       return callClaudeWithRetry(params, attempt + 1);
     }
-
-    throw err; // give up after max attempts or non-529 error
+    throw err;
   }
 }
 
-// ─── Claude API Call (with web search loop) ────────────────────────────────────
-// Claude may search the web multiple times before giving a final answer.
-// We keep looping until it's done searching and returns the final text.
-async function askClaude(userPhone, userMessage) {
-  const history = getHistory(userPhone);
+// ─── Claude API Call ───────────────────────────────────────────────────────────
+async function askClaude(phone, userMessage) {
+  const history = getHistory(phone);
   history.push({ role: "user", content: userMessage });
 
   let messages = [...history];
@@ -216,26 +281,21 @@ async function askClaude(userPhone, userMessage) {
       messages,
     });
 
-    // Grab any text from this round
     const textBlocks = response.content.filter((b) => b.type === "text");
     if (textBlocks.length > 0) {
       finalText = textBlocks.map((b) => b.text).join("");
     }
 
-    // Claude is done — no more tool calls
     if (response.stop_reason === "end_turn") break;
 
-    // Claude wants to search the web — feed results back and continue
     if (response.stop_reason === "tool_use") {
       const toolUseBlocks = response.content.filter((b) => b.type === "tool_use");
       messages.push({ role: "assistant", content: response.content });
-
       const toolResults = toolUseBlocks.map((block) => ({
         type: "tool_result",
         tool_use_id: block.id,
         content: block.input ? JSON.stringify(block.input) : "Search completed.",
       }));
-
       messages.push({ role: "user", content: toolResults });
       continue;
     }
@@ -243,13 +303,11 @@ async function askClaude(userPhone, userMessage) {
     break;
   }
 
-  // Save the full conversation
   if (finalText) {
     history.push({ role: "assistant", content: finalText });
-    saveHistory(userPhone, history);
+    saveHistory(phone, history);
   }
 
-  // Split into individual SMS messages
   const smsParts = finalText
     .split("---SMS---")
     .map((s) => s.trim())
@@ -260,7 +318,7 @@ async function askClaude(userPhone, userMessage) {
     : ["Scout couldn't find that one — try rephrasing and I'll look again! 🔍"];
 }
 
-// ─── Send SMS via Twilio ────────────────────────────────────────────────────────
+// ─── Send SMS via Twilio ───────────────────────────────────────────────────────
 async function sendSms(to, body) {
   await twilioClient.messages.create({
     from: process.env.TWILIO_PHONE_NUMBER,
@@ -271,29 +329,46 @@ async function sendSms(to, body) {
 
 // ─── Twilio Webhook — incoming SMS ────────────────────────────────────────────
 app.post("/sms", async (req, res) => {
+  // Reply to Twilio immediately — if we wait, Twilio retries and sends duplicates
   res.status(200).send("<Response></Response>");
 
   const fromNumber = req.body.From;
   const incomingMsg = (req.body.Body || "").trim();
+  const messageSid = req.body.MessageSid;
 
   if (!fromNumber || !incomingMsg) return;
 
+  // Drop duplicate webhooks (Twilio retries when your server is busy)
+  if (isDuplicate(messageSid)) {
+    console.log(`⚠️  Duplicate ignored [${messageSid}]`);
+    return;
+  }
+
   console.log(`📱 [${fromNumber}] → "${incomingMsg}"`);
 
-  try {
-    const smsParts = await askClaude(fromNumber, incomingMsg);
+  // Queue this message behind any other message from the same person.
+  // This guarantees their conversation stays in order even if they text fast.
+  enqueueForUser(fromNumber, async () => {
+    // Wait for a free AI slot — max 5 run at the same time
+    await acquireSlot();
 
-    // Join all parts into one message so Twilio handles the splitting.
-    // This guarantees the text always arrives in the correct order —
-    // sending multiple separate messages lets the carrier deliver them
-    // out of sequence, which is why earlier texts were arriving late.
-    const fullMessage = smsParts.join("\n\n");
-    await sendSms(fromNumber, fullMessage);
-    console.log(`✉️  [${fromNumber}] ← sent (${smsParts.length} sections, 1 message)`);
-  } catch (err) {
-    console.error("Error:", err.message);
-    await sendSms(fromNumber, "Scout hit a snag — try again in a moment! 🔍");
-  }
+    // Let the user know Scout is working — search takes 5-15 seconds
+    try {
+      await sendSms(fromNumber, "🔍 Scouting that for you now — reply coming shortly!");
+    } catch (_) {}
+
+    try {
+      const smsParts = await askClaude(fromNumber, incomingMsg);
+      const fullMessage = smsParts.join("\n\n");
+      await sendSms(fromNumber, fullMessage);
+      console.log(`✉️  [${fromNumber}] ← sent`);
+    } catch (err) {
+      console.error(`Error [${fromNumber}]:`, err.message);
+      await sendSms(fromNumber, "Scout hit a snag — try again in a moment! 🔍");
+    } finally {
+      releaseSlot();
+    }
+  });
 });
 
 // ─── Health check ──────────────────────────────────────────────────────────────
@@ -302,10 +377,12 @@ app.get("/health", (req, res) => {
     status: "ok",
     service: "PocketScout",
     activeConversations: conversations.size,
+    activeAiCalls: activeCount,
+    waitingInQueue: waitingQueue.length,
   });
 });
 
-// ─── Clear a conversation (admin use) ─────────────────────────────────────────
+// ─── Clear a conversation ──────────────────────────────────────────────────────
 app.delete("/conversation/:phone", (req, res) => {
   const phone = decodeURIComponent(req.params.phone);
   conversations.delete(phone);
@@ -313,10 +390,6 @@ app.delete("/conversation/:phone", (req, res) => {
 });
 
 // ─── Start ─────────────────────────────────────────────────────────────────────
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`

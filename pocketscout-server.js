@@ -1,17 +1,15 @@
 /**
- * PocketScout SMS Server — Agent Edition v2
+ * PocketScout SMS Server — Agent Edition v4
  *
- * What's new vs. v1:
- *   • Prompt caching on system prompts (~90% input cost reduction on repeats)
- *   • Articulated agent prompts: reasoning steps + few-shot examples + don'ts
- *   • Dedicated follow-up agent for "1", "yes", "more", city replies
- *   • User state: remembers city, last intent, last results across turns
- *   • Few-shot intent classifier (much higher accuracy on edge cases)
- *   • Query/response logging to JSONL for later analysis & fine-tuning
- *   • Google Places call has a 10s timeout (no more hung concurrency slots)
- *   • Per-agent MAX_TURNS (grocery/recipe get more turns)
- *   • Cleaner result type ({ text, needsAck }) — no magic underscore property
- *   • Honest "MORE" support
+ * What's new vs. v3:
+ *   • Quality fallback: if all nearby spots are below the minRating threshold,
+ *     widen the radius automatically and tell the user honestly
+ *   • google_places_search accepts `minRating` and returns a `widened` flag
+ *   • Restaurant/Service/Review prompts updated to handle widened results
+ *
+ * Carried from v3:
+ *   • Neighbourhood-aware search with 5km hard radius
+ *   • Geocode cache, haversine post-filter, scout-tier safety check, prompt caching
  */
 
 require("dotenv").config();
@@ -36,11 +34,16 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 // ============================================================
 const ROUTER_MODEL = "claude-haiku-4-5-20251001";
 const AGENT_MODEL = "claude-sonnet-4-20250514";
-const CONVERSATION_TTL_MS = 3 * 60 * 60 * 1000; // 3 hours
+const CONVERSATION_TTL_MS = 3 * 60 * 60 * 1000;
 const TWILIO_MAX_CHARS = 1500;
 const MAX_CONCURRENT = 5;
 const DEFAULT_MAX_TURNS = 6;
 const PLACES_TIMEOUT_MS = 10_000;
+const GEOCODE_TIMEOUT_MS = 5_000;
+const NEIGHBOURHOOD_RADIUS_M = 5_000; // 5 km ≈ 5–10 min drive
+const WIDER_RADIUS_M = 12_000; // 12 km fallback when nothing good nearby
+const DEFAULT_MIN_RATING = 4.0; // quality bar for restaurants/services
+const DEFAULT_MIN_REVIEWS = 20; // ignore places with too few reviews
 const LOG_DIR = process.env.LOG_DIR || "./logs";
 
 // ============================================================
@@ -51,7 +54,6 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
 
 function logInteraction(record) {
-  // One JSONL file per day so it's easy to review later
   const day = new Date().toISOString().slice(0, 10);
   const file = path.join(LOG_DIR, `pocketscout-${day}.jsonl`);
   const line = JSON.stringify({ ts: Date.now(), ...record }) + "\n";
@@ -60,24 +62,92 @@ function logInteraction(record) {
   });
 }
 
+function haversineMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+// ============================================================
+// GEOCODE CACHE — neighbourhoods don't move, cache forever
+// ============================================================
+const geocodeCache = new Map();
+
+async function geocodeNeighbourhood(neighbourhood, city) {
+  if (!process.env.GOOGLE_PLACES_API_KEY) return null;
+  const key = `${neighbourhood.toLowerCase()}|${city.toLowerCase()}`;
+  if (geocodeCache.has(key)) return geocodeCache.get(key);
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GEOCODE_TIMEOUT_MS);
+  try {
+    const response = await fetch("https://places.googleapis.com/v1/places:searchText", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": process.env.GOOGLE_PLACES_API_KEY,
+        "X-Goog-FieldMask": "places.location,places.displayName,places.formattedAddress",
+      },
+      body: JSON.stringify({
+        textQuery: `${neighbourhood}, ${city}`,
+        maxResultCount: 1,
+      }),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    const place = data.places?.[0];
+    if (!place?.location) return null;
+    const coords = {
+      lat: place.location.latitude,
+      lng: place.location.longitude,
+      label: place.displayName?.text || neighbourhood,
+    };
+    geocodeCache.set(key, coords);
+    return coords;
+  } catch (err) {
+    console.error(`Geocode failed for "${neighbourhood}, ${city}":`, err.message);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 // ============================================================
 // CONVERSATION STORE
-//   Per-phone state: messages, city, lastIntent, lastResults, updatedAt
 // ============================================================
 const conversations = new Map();
 
 function getState(phone) {
   const entry = conversations.get(phone);
   if (!entry) {
-    return { messages: [], city: null, lastIntent: null, lastResults: null };
+    return {
+      messages: [],
+      city: null,
+      neighbourhood: null,
+      lastIntent: null,
+      lastResults: null,
+    };
   }
   if (Date.now() - entry.updatedAt > CONVERSATION_TTL_MS) {
     conversations.delete(phone);
-    return { messages: [], city: null, lastIntent: null, lastResults: null };
+    return {
+      messages: [],
+      city: null,
+      neighbourhood: null,
+      lastIntent: null,
+      lastResults: null,
+    };
   }
   return {
     messages: entry.messages.length > 10 ? entry.messages.slice(-10) : entry.messages,
     city: entry.city || null,
+    neighbourhood: entry.neighbourhood || null,
     lastIntent: entry.lastIntent || null,
     lastResults: entry.lastResults || null,
   };
@@ -101,8 +171,6 @@ setInterval(() => {
   }
 }, 15 * 60 * 1000);
 
-// Lightweight city extractor — runs on every user message.
-// Catches "Calgary", "Edmonton AB", "I'm in Vancouver", etc.
 const CANADIAN_CITIES = [
   "calgary", "edmonton", "red deer", "lethbridge", "medicine hat", "fort mcmurray",
   "grande prairie", "airdrie", "okotoks", "cochrane", "canmore", "banff",
@@ -119,7 +187,6 @@ function extractCity(message) {
   for (const city of CANADIAN_CITIES) {
     const re = new RegExp(`\\b${city}\\b`, "i");
     if (re.test(lower)) {
-      // Title-case the matched city
       const matched = lower.match(re)[0];
       return matched.replace(/\b\w/g, (c) => c.toUpperCase());
     }
@@ -127,8 +194,28 @@ function extractCity(message) {
   return null;
 }
 
+// Detect a neighbourhood reference. We don't try to know every neighbourhood —
+// we look for linguistic patterns that signal "the user named an area".
+// Google Places handles the rest when we pass the matched string.
+function extractNeighbourhood(message) {
+  const patterns = [
+    /\b(?:near|in|around|by|close to)\s+(?:the\s+)?([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,2})/,
+    /\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,2})\s+(?:area|neighbourhood|neighborhood|district)\b/i,
+  ];
+  for (const re of patterns) {
+    const m = message.match(re);
+    if (m && m[1]) {
+      const candidate = m[1].trim();
+      if (CANADIAN_CITIES.includes(candidate.toLowerCase())) continue;
+      if (candidate.length < 4) continue;
+      return candidate;
+    }
+  }
+  return null;
+}
+
 // ============================================================
-// DUPLICATE MESSAGE FILTER
+// DUPLICATE FILTER
 // ============================================================
 const processedMessageIds = new Set();
 const MESSAGE_ID_LIMIT = 200;
@@ -145,7 +232,7 @@ function isDuplicate(messageSid) {
 }
 
 // ============================================================
-// PER-USER QUEUE
+// PER-USER QUEUE & CONCURRENCY LIMITER
 // ============================================================
 const userQueues = new Map();
 
@@ -160,9 +247,6 @@ function enqueueForUser(phone, task) {
   });
 }
 
-// ============================================================
-// GLOBAL CONCURRENCY LIMITER
-// ============================================================
 let activeCount = 0;
 const waitingQueue = [];
 
@@ -183,12 +267,18 @@ function releaseSlot() {
 }
 
 // ============================================================
-// GOOGLE PLACES — with timeout
+// GOOGLE PLACES — neighbourhood-aware + quality-aware
+//
+// Strategy:
+//   1. Search the tight neighbourhood radius
+//   2. Filter to minRating + minReviewCount
+//   3. If nothing qualifies, widen to WIDER_RADIUS_M and try again
+//   4. Return a `widened: true` flag so the agent can be honest with the user
 // ============================================================
-async function callGooglePlaces(query, city) {
-  if (!process.env.GOOGLE_PLACES_API_KEY) {
-    return { error: "Google Places not configured. Fall back to web_search." };
-  }
+async function placesRequest(textQuery, bias) {
+  const body = { textQuery, maxResultCount: 10 };
+  if (bias) body.locationBias = bias;
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), PLACES_TIMEOUT_MS);
   try {
@@ -201,13 +291,65 @@ async function callGooglePlaces(query, city) {
         "X-Goog-FieldMask":
           "places.displayName,places.formattedAddress,places.rating," +
           "places.userRatingCount,places.nationalPhoneNumber," +
-          "places.websiteUri,places.priceLevel,places.businessStatus",
+          "places.websiteUri,places.priceLevel,places.businessStatus," +
+          "places.location",
       },
-      body: JSON.stringify({ textQuery: `${query} in ${city}`, maxResultCount: 8 }),
+      body: JSON.stringify(body),
     });
     if (!response.ok) return { error: `Places API error: ${response.status}` };
     const data = await response.json();
-    const places = (data.places || []).slice(0, 5).map((p) => ({
+    return { places: data.places || [] };
+  } catch (err) {
+    if (err.name === "AbortError") {
+      return { error: "Places lookup timed out." };
+    }
+    return { error: `Places lookup failed: ${err.message}` };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function filterAndFormat(places, center, radiusM, minRating, minReviews) {
+  // Distance filter
+  let filtered = places.filter((p) => {
+    if (!p.location) return false;
+    if (!center) return true;
+    const d = haversineMeters(
+      center.latitude,
+      center.longitude,
+      p.location.latitude,
+      p.location.longitude
+    );
+    return d <= radiusM;
+  });
+
+  // Quality filter
+  filtered = filtered.filter((p) => {
+    const rating = p.rating || 0;
+    const reviews = p.userRatingCount || 0;
+    return rating >= minRating && reviews >= minReviews;
+  });
+
+  // Sort by rating descending, then by review count descending
+  filtered.sort((a, b) => {
+    const ra = a.rating || 0;
+    const rb = b.rating || 0;
+    if (rb !== ra) return rb - ra;
+    return (b.userRatingCount || 0) - (a.userRatingCount || 0);
+  });
+
+  return filtered.slice(0, 5).map((p) => {
+    const distanceM = center && p.location
+      ? Math.round(
+          haversineMeters(
+            center.latitude,
+            center.longitude,
+            p.location.latitude,
+            p.location.longitude
+          )
+        )
+      : null;
+    return {
       name: p.displayName?.text,
       address: p.formattedAddress,
       rating: p.rating,
@@ -216,16 +358,102 @@ async function callGooglePlaces(query, city) {
       website: p.websiteUri,
       priceLevel: p.priceLevel,
       status: p.businessStatus,
-    }));
-    return { places };
-  } catch (err) {
-    if (err.name === "AbortError") {
-      return { error: "Places lookup timed out. Fall back to web_search." };
-    }
-    return { error: `Places lookup failed: ${err.message}` };
-  } finally {
-    clearTimeout(timeout);
+      distanceKm: distanceM != null ? +(distanceM / 1000).toFixed(1) : null,
+    };
+  });
+}
+
+async function callGooglePlaces(query, city, near, opts = {}) {
+  if (!process.env.GOOGLE_PLACES_API_KEY) {
+    return { error: "Google Places not configured. Fall back to web_search." };
   }
+
+  const minRating = opts.minRating ?? DEFAULT_MIN_RATING;
+  const minReviews = opts.minReviews ?? DEFAULT_MIN_REVIEWS;
+
+  let center = null;
+  let neighbourhoodLabel = null;
+  if (near && city) {
+    const coords = await geocodeNeighbourhood(near, city);
+    if (coords) {
+      center = { latitude: coords.lat, longitude: coords.lng };
+      neighbourhoodLabel = coords.label;
+      console.log(
+        `   ↳ centred on ${coords.label} (${coords.lat.toFixed(3)}, ${coords.lng.toFixed(3)})`
+      );
+    } else {
+      console.log(`   ↳ couldn't geocode "${near}, ${city}" — falling back to city-wide`);
+    }
+  }
+
+  // Pass 1: tight radius around the neighbourhood
+  const tightQuery = near ? `${query} near ${near}, ${city}` : `${query} in ${city}`;
+  const tightBias = center
+    ? { circle: { center, radius: NEIGHBOURHOOD_RADIUS_M } }
+    : null;
+
+  const r1 = await placesRequest(tightQuery, tightBias);
+  if (r1.error) return r1;
+
+  let formatted = filterAndFormat(
+    r1.places,
+    center,
+    NEIGHBOURHOOD_RADIUS_M,
+    minRating,
+    minReviews
+  );
+
+  if (formatted.length >= 3 || !center) {
+    return {
+      places: formatted,
+      radiusKm: NEIGHBOURHOOD_RADIUS_M / 1000,
+      widened: false,
+      neighbourhood: neighbourhoodLabel,
+      minRating,
+    };
+  }
+
+  // Pass 2: widen the radius — there weren't enough quality results nearby
+  console.log(
+    `   ↳ only ${formatted.length} qualifying results within ${NEIGHBOURHOOD_RADIUS_M / 1000}km — widening to ${WIDER_RADIUS_M / 1000}km`
+  );
+  const wideBias = { circle: { center, radius: WIDER_RADIUS_M } };
+  const r2 = await placesRequest(`${query} in ${city}`, wideBias);
+  if (r2.error) return r2;
+
+  const widerFormatted = filterAndFormat(
+    r2.places,
+    center,
+    WIDER_RADIUS_M,
+    minRating,
+    minReviews
+  );
+
+  if (widerFormatted.length === 0) {
+    return {
+      places: [],
+      radiusKm: WIDER_RADIUS_M / 1000,
+      widened: true,
+      neighbourhood: neighbourhoodLabel,
+      minRating,
+      note:
+        `No spots rated ${minRating}+ stars with ${minReviews}+ reviews found within ` +
+        `${WIDER_RADIUS_M / 1000}km of ${near}. Tell the user honestly and offer to ` +
+        `lower the rating bar or expand to all of ${city}.`,
+    };
+  }
+
+  return {
+    places: widerFormatted,
+    radiusKm: WIDER_RADIUS_M / 1000,
+    widened: true,
+    neighbourhood: neighbourhoodLabel,
+    minRating,
+    note:
+      `No spots rated ${minRating}+ within ${NEIGHBOURHOOD_RADIUS_M / 1000}km of ${near}. ` +
+      `Showing ${minRating}+ rated spots within ${WIDER_RADIUS_M / 1000}km instead. ` +
+      `Tell the user this clearly so they understand the drive distance.`,
+  };
 }
 
 // ============================================================
@@ -236,20 +464,48 @@ const WEB_SEARCH_TOOL = { type: "web_search_20250305", name: "web_search" };
 const GOOGLE_PLACES_TOOL = {
   name: "google_places_search",
   description:
-    "Search for real local businesses, restaurants, or services in a specific Canadian city. " +
-    "Returns actual business names, addresses, phone numbers, websites, star ratings, and review counts " +
-    "from Google Maps. Use this BEFORE web_search when looking for independent local shops, " +
-    "service providers, or restaurants.",
+    "Search for real local businesses, restaurants, or services in a Canadian city. " +
+    "Returns business names, addresses, phones, websites, star ratings, review counts, " +
+    "and distance from the neighbourhood centre. " +
+    "If user mentions a neighbourhood ('Strathcona', 'Kensington', 'Beltline'), pass it " +
+    "as `near` — results are filtered to a 5km radius. " +
+    "If fewer than 3 spots within 5km meet the quality bar, the tool AUTOMATICALLY " +
+    "widens to 12km and returns `widened: true` so you can tell the user honestly. " +
+    "Use `minRating` to set the quality bar (default 4.0). For restaurants and services " +
+    "use 4.0; for things where quality matters less you can lower it. " +
+    "If even the wider search returns nothing, the tool returns places=[] with a note — " +
+    "tell the user honestly and offer to lower the bar or widen further.",
   input_schema: {
     type: "object",
     properties: {
       query: {
         type: "string",
-        description: "What to search for, e.g. 'independent mechanic' or 'Vietnamese restaurant'",
+        description: "What to search for, e.g. 'Italian pasta restaurant' or 'independent mechanic'",
       },
       city: {
         type: "string",
-        description: "The city and province, e.g. 'Calgary, AB' or 'Toronto, ON'",
+        description: "City and province, e.g. 'Calgary, AB' or 'Toronto, ON'",
+      },
+      near: {
+        type: "string",
+        description:
+          "Optional neighbourhood/area within the city. Examples: 'Strathcona', " +
+          "'Kensington', 'Beltline', 'Inglewood', 'Yaletown'. Omit if user did not " +
+          "mention a specific area.",
+      },
+      minRating: {
+        type: "number",
+        description:
+          "Minimum star rating to include (default 4.0). Use 4.0 for restaurants " +
+          "and services. Lower (e.g. 3.5) only if the user explicitly wants more " +
+          "options regardless of quality.",
+      },
+      minReviews: {
+        type: "number",
+        description:
+          "Minimum review count to trust the rating (default 20). A 5-star rating " +
+          "with only 2 reviews is unreliable. Lower this only if the user is looking " +
+          "for new/hidden gem businesses.",
       },
     },
     required: ["query", "city"],
@@ -282,9 +538,6 @@ async function callClaudeWithRetry(params, attempt = 1) {
 
 // ============================================================
 // AGENT RUNNER
-//   - Caches the system prompt (cache_control: ephemeral)
-//   - Caches the tools array
-//   - Supports per-agent maxTurns
 // ============================================================
 async function runAgent({ systemPrompt, tools, history, userMessage, maxTurns = DEFAULT_MAX_TURNS }) {
   history.push({ role: "user", content: userMessage });
@@ -293,13 +546,10 @@ async function runAgent({ systemPrompt, tools, history, userMessage, maxTurns = 
   let cacheReadTokens = 0;
   let cacheCreateTokens = 0;
 
-  // Cache the system prompt — this is the BIG win.
-  // Same agent prompt is sent on every request, so we get ~90% off after the first call.
   const cachedSystem = [
     { type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } },
   ];
 
-  // Cache tool definitions too — they're large and never change.
   const cachedTools = tools.map((tool, i) => {
     if (i === tools.length - 1) {
       return { ...tool, cache_control: { type: "ephemeral" } };
@@ -316,7 +566,6 @@ async function runAgent({ systemPrompt, tools, history, userMessage, maxTurns = 
       messages,
     });
 
-    // Track cache usage so we can verify it's working
     if (response.usage) {
       cacheReadTokens += response.usage.cache_read_input_tokens || 0;
       cacheCreateTokens += response.usage.cache_creation_input_tokens || 0;
@@ -340,7 +589,15 @@ async function runAgent({ systemPrompt, tools, history, userMessage, maxTurns = 
 
       const toolResults = [];
       for (const call of clientToolCalls) {
-        const result = await callGooglePlaces(call.input.query, call.input.city);
+        const result = await callGooglePlaces(
+          call.input.query,
+          call.input.city,
+          call.input.near,
+          {
+            minRating: call.input.minRating,
+            minReviews: call.input.minReviews,
+          }
+        );
         toolResults.push({
           type: "tool_result",
           tool_use_id: call.id,
@@ -359,21 +616,89 @@ async function runAgent({ systemPrompt, tools, history, userMessage, maxTurns = 
 }
 
 // ============================================================
-// SHARED RULES (included in every agent prompt)
+// SCOUT TIER SAFETY CHECK
+// ============================================================
+const TIER_REQUIREMENTS = {
+  product: {
+    required: ["MADE IN CANADA", "BEST CANADIAN RETAILER"],
+    requireOneOf: true,
+    tier2: ["LOCAL STORE"],
+    tier3: ["CHEAPEST"],
+  },
+  grocery: {
+    required: ["MADE IN CANADA"],
+    tier2: ["LOCAL STORE"],
+    tier3: ["CHEAPEST"],
+  },
+  recipe: {
+    required: ["MADE IN CANADA"],
+    tier2: ["LOCAL STORE"],
+    tier3: ["CHEAPEST"],
+  },
+  restaurant: {
+    required: ["LOCAL:"],
+    minLocalCount: 2,
+  },
+};
+
+function checkScoutTiers(intent, replyText) {
+  const rules = TIER_REQUIREMENTS[intent];
+  if (!rules) return { ok: true };
+
+  const issues = [];
+  const upper = replyText.toUpperCase();
+
+  if (rules.required) {
+    if (rules.requireOneOf) {
+      const hasAny = rules.required.some((m) => upper.includes(m.toUpperCase()));
+      if (!hasAny) {
+        issues.push(`Missing Tier 1 marker (one of: ${rules.required.join(", ")})`);
+      }
+    } else {
+      for (const marker of rules.required) {
+        if (!upper.includes(marker.toUpperCase())) {
+          issues.push(`Missing Tier 1 marker: ${marker}`);
+        }
+      }
+    }
+  }
+
+  if (rules.tier2) {
+    const has = rules.tier2.some((m) => upper.includes(m.toUpperCase()));
+    if (!has) issues.push(`Missing Tier 2 marker (${rules.tier2.join(" or ")})`);
+  }
+
+  if (rules.tier3) {
+    const has = rules.tier3.some((m) => upper.includes(m.toUpperCase()));
+    if (!has) issues.push(`Missing Tier 3 marker (${rules.tier3.join(" or ")})`);
+  }
+
+  if (rules.minLocalCount) {
+    const matches = upper.match(/LOCAL:/g) || [];
+    if (matches.length < rules.minLocalCount) {
+      issues.push(`Only ${matches.length} LOCAL: marker(s), expected ${rules.minLocalCount}`);
+    }
+  }
+
+  return { ok: issues.length === 0, issues };
+}
+
+// ============================================================
+// SHARED RULES
 // ============================================================
 const SHARED_RULES = `
 ═══ TONE — Arlene Dickinson style ═══
 - Warm, direct, honest. A trusted Canadian friend, not a corporate bot.
 - BANNED openers: "Certainly", "Absolutely", "I'd be happy to", "Of course", "Sure thing".
 - Never start a message with "I".
-- Celebrate Canadian choices naturally, never preachy or guilt-trippy.
-- When a local option costs more, SAY SO honestly and let the customer decide.
+- Celebrate Canadian choices naturally, never preachy.
+- When a local option costs more, SAY SO honestly.
 
 ═══ FORMAT ═══
 - Hard limit: 1500 characters per reply (SMS).
 - Short lines. No long paragraphs.
-- Emojis sparingly: 🍁 for Canadian. Max 2 emojis per message.
-- Always end with a clear next-action prompt ("Reply 1, 2, or 3 for...").
+- Emojis sparingly: 🍁 for Canadian. Max 2 per message.
+- Always end with a clear next-action prompt.
 
 ═══ PRICE HONESTY ═══
 - Never guess prices. Search first.
@@ -382,21 +707,28 @@ const SHARED_RULES = `
   coop.ca, marks.com, princessauto.com, official brand sites, flipp.com.
 - IGNORE: blogs, Reddit, forums, Quora, generic listicles.
 - If a sale date has passed OR the page wasn't updated in 7+ days, discard it.
-- If you can't verify a price, write "Price unavailable - check in store" — don't guess.
+- If you can't verify, write "Price unavailable - check in store".
+
+═══ LOCATION AWARENESS ═══
+- If the user mentions a neighbourhood/area (e.g. "near Strathcona", "in Kensington",
+  "around Inglewood", "by the Beltline"), pass it as the \`near\` field of
+  google_places_search. Results are filtered to a 5km radius (~5-10 min drive).
+- If no results come back within that radius, tell the user honestly and offer
+  to widen the search to the full city.
+- City and neighbourhood may also be remembered from earlier — check history first.
 
 ═══ SELF-CHECK BEFORE REPLYING ═══
-Before sending, verify ALL of:
-✓ Reply is under 1500 characters
-✓ Doesn't start with "I" or any banned opener
-✓ All required tiers/options are filled (use fallback if needed)
-✓ Every price is from a TRUSTED domain
-✓ Honest about local-vs-cheapest tradeoffs
+✓ Reply under 1500 characters
+✓ Doesn't start with "I" or banned opener
+✓ All required tiers filled (use fallback if needed)
+✓ Every price from a TRUSTED domain
+✓ Honest about local-vs-cheapest
+✓ If user named a neighbourhood, results are actually near it
 ✓ Ends with a next-action prompt
-If any check fails — fix it before responding.
 `;
 
 // ============================================================
-// AGENT: GREETING (canned, no AI call)
+// AGENT PROMPTS
 // ============================================================
 const GREETING_RESPONSE = `Hey! Welcome to PocketScout 🍁
 
@@ -412,57 +744,40 @@ What I can scout for you:
 
 Which city are you in? Let's scout it out! 🔍`;
 
-// ============================================================
-// AGENT: PRODUCT
-// ============================================================
 const PRODUCT_PROMPT = `You are PocketScout's Product Agent. You find the best deal on a single product for Canadian customers, ranked by the Scout Tier system.
 ${SHARED_RULES}
 
-═══ YOUR REASONING PROCESS ═══
-Before responding, work through these steps:
-
-1. PARSE the request. What is the product? What city?
-   - If city is missing from message AND not in conversation history, ask once:
-     "Which city are you in? I'll scout it out!"
-
-2. PLAN three searches:
-   - Tier 1 (MADE IN CANADA): Find a Canadian-MADE brand of this product.
-     Example query: "Canadian made <product> brand"
-     If no Canadian-made version exists, find a Canadian-OWNED retailer carrying it
-     and label that result "BEST CANADIAN RETAILER".
-   - Tier 2 (LOCAL STORE): Find an independent shop in <city> selling this.
-     Example query: "independent <product category> store <city> AB"
-   - Tier 3 (CHEAPEST): Lowest verified price across trusted domains.
-     Example query: "<product> price site:walmart.ca OR site:amazon.ca"
-
-3. EXECUTE searches. Run web_search up to 4 times.
-   After each search, ask yourself: "Do I have a verified price from a trusted domain?"
-
-4. SELF-CHECK using the rules above. Then reply.
+═══ REASONING ═══
+1. Parse: product, city, neighbourhood (if any).
+   If city missing AND not in history, ask "Which city are you in?"
+2. Plan three searches:
+   - Tier 1 MADE IN CANADA: Canadian-made brand. If none, fall back to BEST CANADIAN RETAILER.
+   - Tier 2 LOCAL STORE: Independent shop in <city>, near <neighbourhood> if given.
+   - Tier 3 CHEAPEST: Lowest verified price on trusted domains.
+3. Up to 4 web_searches.
+4. Self-check and reply.
 
 ═══ OUTPUT FORMAT ═══
 Found <product> in <city>!
 1. MADE IN CANADA: $XX - <Brand> at <retailer>
 2. LOCAL STORE: $XX at <Store> - <address>
 3. CHEAPEST: $XX at <Store> - <link>
-<Optional one-line honesty note>
 Prices checked today
 Reply 1, 2, or 3 for location, phone & web info!
 
 ═══ EXAMPLES ═══
-
-Example 1 — straightforward product, Canadian brand exists:
+Example — Canadian brand exists:
 User: "winter boots in Calgary"
 Reply:
 "Found winter boots in Calgary!
 1. MADE IN CANADA: $189 - Baffin Tundra at Mark's
-2. LOCAL STORE: $165 at Lammle's Western Wear - 209 8 Ave SW
+2. LOCAL STORE: $165 at Lammle's - 209 8 Ave SW
 3. CHEAPEST: $89 at Amazon.ca (Columbia Bugaboot)
 Local pick is $76 more but stays in Calgary 🍁
 Prices checked today
 Reply 1, 2, or 3 for location, phone & web info!"
 
-Example 2 — no Canadian-made version exists:
+Example — no Canadian-made version:
 User: "iPhone 15 case Edmonton"
 Reply:
 "Found iPhone 15 cases in Edmonton!
@@ -472,42 +787,24 @@ Reply:
 Prices checked today
 Reply 1, 2, or 3 for location, phone & web info!"
 
-Example 3 — small town, no independent shop found:
-User: "espresso machine Red Deer"
-Reply:
-"Found espresso machines in Red Deer!
-1. MADE IN CANADA: $549 - Cuisinart EM-200C at Canadian Tire
-2. LOCAL STORE: No independent shop found in Red Deer - nearest is Bean & Bean Coffee (Calgary)
-3. CHEAPEST: $329 at Amazon.ca (Breville Bambino)
-Prices checked today
-Reply 1, 2, or 3 for location, phone & web info!"
+═══ DON'T ═══
+❌ Banned opener
+❌ Prices from blogs, Reddit, forums
+❌ Guess a price
+❌ Skip Tier 1 — fall back to BEST CANADIAN RETAILER
+❌ Hide that local costs more`;
 
-═══ DON'T DO THIS ═══
-❌ "I'd be happy to help you find boots!" — banned opener
-❌ Showing prices from blogs, Reddit, or forums
-❌ Guessing a price when none was found — say "Price unavailable"
-❌ Skipping Tier 1 because no Canadian-made version exists — fall back to "BEST CANADIAN RETAILER"
-❌ Hiding that the local option costs more — be honest`;
-
-// ============================================================
-// AGENT: GROCERY
-// ============================================================
-const GROCERY_PROMPT = `You are PocketScout's Grocery Agent. You price full grocery lists across 3 stores and tell the customer the cheapest basket.
+const GROCERY_PROMPT = `You are PocketScout's Grocery Agent. Price full grocery lists across 3 stores.
 ${SHARED_RULES}
 
-═══ YOUR REASONING PROCESS ═══
-1. PARSE the list. Count items. Confirm city.
-2. For each of 3 stores, estimate the basket total:
-   - Tier 1 MADE IN CANADA: Canadian-made brands at a Canadian retailer (Sobeys, Loblaws, Co-op, Save-On-Foods).
-   - Tier 2 LOCAL STORE: Independent local grocer in <city>.
-   - Tier 3 CHEAPEST: Lowest total anywhere (Walmart, Costco, No Frills, etc.).
-3. PRICING RULE per item:
-   - Verified official price found → use it.
-   - No verified price → use a realistic estimate from typical Canadian prices, mark "(est.)" internally.
-   - If ANY item used an estimate, add the asterisk note at the bottom.
-4. SHOW only the 3 store TOTALS in the first reply (no per-item breakdown unless asked).
-5. State the approximate savings.
-6. SELF-CHECK and reply.
+═══ REASONING ═══
+1. Parse list, count items, confirm city.
+2. Estimate basket totals at:
+   - Tier 1 MADE IN CANADA: Canadian retailer (Sobeys, Loblaws, Co-op, Save-On).
+   - Tier 2 LOCAL STORE: Independent grocer in <city>.
+   - Tier 3 CHEAPEST: Lowest total (Walmart, Costco, No Frills).
+3. Per item: verified price preferred; otherwise mark "(est.)" internally.
+4. Show 3 totals. State savings. Self-check. Reply.
 
 ═══ OUTPUT FORMAT ═══
 Scouted your <X>-item list in <city>!
@@ -517,40 +814,16 @@ Scouted your <X>-item list in <city>!
 Save ~$X.XX by choosing option 3!
 * Some prices estimated - may vary at checkout
 Reply YES for full item breakdown
-Reply 1, 2, or 3 for location, phone & web info!
+Reply 1, 2, or 3 for location, phone & web info!`;
 
-═══ EXAMPLE ═══
-User: "milk, eggs, bread, chicken breast, apples, pasta sauce — Calgary"
-Reply:
-"Scouted your 6-item list in Calgary!
-1. MADE IN CANADA: ~$32.40 at Sobeys
-2. LOCAL STORE: ~$35.10 at Blush Lane Organic Market
-3. CHEAPEST: ~$26.85 at No Frills
-Save ~$5.55 by choosing option 3!
-* Some prices estimated - may vary at checkout
-Reply YES for full item breakdown
-Reply 1, 2, or 3 for location, phone & web info!"
-
-═══ DON'T ═══
-❌ Show per-item prices in the first reply (only on YES follow-up)
-❌ Skip the savings line
-❌ Use unfamiliar regional chains the customer can't actually reach`;
-
-// ============================================================
-// AGENT: RECIPE
-// ============================================================
-const RECIPE_PROMPT = `You are PocketScout's Recipe Agent. You price the top 5 most expensive ingredients of a recipe across 3 Canadian stores.
+const RECIPE_PROMPT = `You are PocketScout's Recipe Agent. Price the top 5 most expensive ingredients across 3 stores.
 ${SHARED_RULES}
 
-═══ REASONING PROCESS ═══
-1. IDENTIFY the dish and its ingredients. Pick the TOP 5 most expensive (proteins, cheeses, oils, spices).
+═══ REASONING ═══
+1. Identify dish. Pick TOP 5 most expensive ingredients.
 2. Confirm city.
-3. Price those 5 at:
-   - Tier 1 MADE IN CANADA: Canadian-made versions at a Canadian retailer.
-   - Tier 2 LOCAL STORE: Independent local grocer.
-   - Tier 3 CHEAPEST: Lowest total anywhere.
-4. Show only the 3 store totals in first reply.
-5. State exact savings. Self-check. Reply.
+3. Price 5 ingredients at Tier 1 / 2 / 3 stores.
+4. Show 3 totals. State savings.
 
 ═══ OUTPUT FORMAT ═══
 <Dish> ingredients in <city>!
@@ -560,44 +833,17 @@ ${SHARED_RULES}
 Save $X.XX by choosing option 3!
 Prices checked today
 Reply YES for full ingredient list
-Reply 1, 2, or 3 for location, phone & web info!
+Reply 1, 2, or 3 for location, phone & web info!`;
 
-═══ EXAMPLE ═══
-User: "I want to make butter chicken for 4, I'm in Calgary"
-Reply:
-"Butter chicken ingredients in Calgary!
-1. MADE IN CANADA: $28.40 at Sobeys
-2. LOCAL STORE: $31.10 at Spice Centre
-3. CHEAPEST: $22.85 at Walmart
-Save $5.55 by choosing option 3!
-Prices checked today
-Reply YES for full ingredient list
-Reply 1, 2, or 3 for location, phone & web info!"
-
-═══ DON'T ═══
-❌ Price every single ingredient (only top 5 by cost)
-❌ Forget to confirm servings if it changes the math significantly`;
-
-// ============================================================
-// AGENT: LOCAL MAKER
-// ============================================================
-const LOCAL_MAKER_PROMPT = `You are PocketScout's Local Maker Agent. You find handmade and artisan goods from independent Canadian creators.
+const LOCAL_MAKER_PROMPT = `You are PocketScout's Local Maker Agent.
 ${SHARED_RULES}
 
 ═══ HARD CONSTRAINTS ═══
-- Search ONLY: Kijiji, Facebook Marketplace, and Etsy (Canadian sellers).
-- NEVER search big-box retailers — the entire point is independent makers.
-- 30-DAY RULE: Only show listings posted in the last 30 days.
-- Every result MUST include: posted date, price, AND a direct link.
-  If any of those is missing, SKIP that listing and find another.
-- If fewer than 3 qualifying listings exist, show what you have and say so.
-
-═══ REASONING PROCESS ═══
-1. Identify the maker product and city.
-2. Search Etsy first (filter Canadian sellers in <city>), then Kijiji, then Facebook Marketplace.
-3. For each candidate, verify: posted within 30 days? has price? has link? If no, skip.
-4. Rank by recency.
-5. Self-check. Reply.
+- Search ONLY: Etsy (Canadian sellers), Kijiji, Facebook Marketplace.
+- NEVER big-box retailers.
+- 30-DAY RULE: Only listings posted in the last 30 days.
+- Each result MUST include: posted date, price, AND link.
+- If <3 qualifying listings, show what you have and say so.
 
 ═══ OUTPUT FORMAT ═══
 Found <product> makers in <city>! 🎨
@@ -619,155 +865,231 @@ Found <product> makers in <city>! 🎨
 
 Reply 1, 2, or 3 for contact & pickup details!
 Note: New listings may have no reviews - check link before buying.
-Supporting local - keeping it Canadian! 🍁
+Supporting local - keeping it Canadian! 🍁`;
 
-═══ DON'T ═══
-❌ Include any chain or big-box result
-❌ Show a listing older than 30 days
-❌ Make up posting dates — if you can't verify, skip it`;
-
-// ============================================================
-// AGENT: SERVICE (uses Google Places)
-// ============================================================
-const SERVICE_PROMPT = `You are PocketScout's Service Agent. You find trusted local service providers — mechanics, salons, cleaners, daycares, groomers, tutors, handymen.
+const SERVICE_PROMPT = `You are PocketScout's Service Agent. Find trusted local service providers.
 ${SHARED_RULES}
 
 ═══ CRITICAL WORKFLOW ═══
-1. ALWAYS call google_places_search FIRST for real business data (names, ratings, phone, address, review counts).
-2. Use web_search ONLY to fill in pricing info Google Places doesn't return.
-3. Prioritize independently owned Canadian businesses over chains.
-4. Return exactly 3 results.
-5. If google_places_search returns an error, fall back to web_search for Google Maps / Yelp listings.
+1. ALWAYS call google_places_search FIRST with minRating: 4.0.
+2. If user mentioned a neighbourhood, pass it as \`near\`.
+3. Handle the three response states the same way as the Restaurant Agent:
+   - widened: false → show top 3 nearby (5km).
+   - widened: true with results → tell user honestly, show distance.
+   - widened: true with empty places → ask whether to lower bar or widen further.
+4. Use web_search ONLY for pricing info Places doesn't return.
+5. Prioritize independents over chains.
+6. Return exactly 3 results when you have them.
 
-═══ OUTPUT FORMAT ═══
-Top 3 <service> in <city>:
-1. <Name> - X stars (XXX reviews) - $XX/hr - <phone>
-2. <Name> - X stars (XXX reviews) - $XX/hr - <phone>
-3. <Name> - X stars (XXX reviews) - $XX/hr - <phone>
+═══ OUTPUT FORMAT — normal ═══
+Top 3 <service> near <neighbourhood>:
+1. <Name> - X.X stars (XXX reviews) - $XX/hr - <phone>
+2. <Name> - X.X stars (XXX reviews) - $XX/hr - <phone>
+3. <Name> - X.X stars (XXX reviews) - $XX/hr - <phone>
 Reply 1, 2, or 3 for address & details!
 
-═══ EXAMPLE ═══
-User: "mechanic in Calgary"
-After google_places_search: 5 results returned with ratings.
+═══ OUTPUT FORMAT — widened ═══
+No 4★+ <service> within 5km of <neighbourhood>.
+Closest highly-rated:
+1. <Name> - X.X stars (XXX reviews) - <distance>km - $XX/hr - <phone>
+2. <Name> - X.X stars (XXX reviews) - <distance>km - $XX/hr - <phone>
+3. <Name> - X.X stars (XXX reviews) - <distance>km - $XX/hr - <phone>
+Reply 1, 2, or 3 for address & details!
+
+═══ EXAMPLE — STATE B (widened) ═══
+User: "mechanic near Inglewood Calgary"
+Tool returns widened=true with 3 results 6-9km away.
 Reply:
-"Top 3 mechanics in Calgary:
-1. Trusted Auto Repair - 4.9 stars (312 reviews) - $110/hr - (403) 555-0142
-2. NW Calgary Auto - 4.8 stars (245 reviews) - $95/hr - (403) 555-0188
-3. Honest-1 Auto Care - 4.7 stars (501 reviews) - $115/hr - (403) 555-0119
+"No 4★+ mechanics within 5km of Inglewood.
+Closest highly-rated:
+1. Bridgeland Auto - 4.8 (210 reviews) - 6.2km - $98/hr - (403) 555-0142
+2. North Hill Mechanics - 4.7 (340 reviews) - 7.5km - $105/hr - (403) 555-0188
+3. East Calgary Service - 4.9 (180 reviews) - 8.8km - $110/hr - (403) 555-0119
 Reply 1, 2, or 3 for address & details!"
 
 ═══ DON'T ═══
-❌ Call web_search before google_places_search (you'll waste turns)
-❌ Recommend a chain when independents are available with good ratings
-❌ Quote a price you didn't verify`;
+❌ Show 3-star options when 4-star options exist further away
+❌ Skip \`near\` when user mentioned an area
+❌ Quote unverified prices`;
 
-// ============================================================
-// AGENT: RESTAURANT (uses Google Places)
-// ============================================================
-const RESTAURANT_PROMPT = `You are PocketScout's Restaurant Agent. You find great local Canadian restaurants.
+const RESTAURANT_PROMPT = `You are PocketScout's Restaurant Agent.
 ${SHARED_RULES}
 
 ═══ CRITICAL WORKFLOW ═══
-1. ALWAYS call google_places_search FIRST for real restaurant data (names, ratings, phone, address, website).
-2. Use web_search to find MENU LINKS — search "<restaurant name> menu".
-3. Prioritize locally owned Canadian restaurants over chains.
-4. Return exactly 3 results.
+1. ALWAYS call google_places_search FIRST with minRating: 4.0.
+2. If user mentioned a neighbourhood, pass it as \`near\`.
+3. The tool may return one of three states — handle each honestly:
 
-═══ FIELDS REQUIRED PER RESTAURANT ═══
+   STATE A — widened: false, places.length >= 3
+     → Normal case. Show top 3 within the 5km radius.
+
+   STATE B — widened: true, places.length >= 1
+     → Nothing 4.0+ within 5km, but tool found 4.0+ within 12km.
+     → BE HONEST: tell the user "no 4-star+ pasta within 5km of Strathcona,
+       here's the closest highly-rated options."
+     → Show distance for each option (the tool returns distanceKm).
+
+   STATE C — widened: true, places.length === 0
+     → Nothing 4.0+ within 12km either.
+     → Don't pretend. Reply: "No 4-star+ pasta found within 12km of Strathcona.
+       Want me to lower the rating bar or check elsewhere?"
+     → Do NOT show 3-star results unless the user explicitly asks.
+
+4. web_search to find MENU LINKS for the chosen options.
+5. Prioritize locally owned over chains.
+6. Return exactly 3 results when you have them.
+
+═══ FIELDS PER RESTAURANT ═══
 cuisine • star rating • review count • price range • dine-in/takeout/delivery • website • menu link.
-
-If no menu found after 2 searches, write "Menu: Not found online - call to ask".
-Never leave the menu field blank.
+If no menu found after 2 searches: "Menu: Not found online - call to ask".
+If widened, also show: distance from <neighbourhood>.
 
 ═══ NEW RESTAURANT WARNING ═══
-If fewer than 50 reviews, add "New restaurant - reviews may not be fully reliable yet."
+If <50 reviews: "New restaurant - reviews may not be fully reliable yet."
 
-═══ OUTPUT FORMAT ═══
-Top 3 <cuisine> restaurants in <city>!
+═══ OUTPUT FORMAT — STATE A (normal) ═══
+Top 3 <cuisine> spots near <neighbourhood>!
 
 1. LOCAL: <Name> - <Cuisine>
-   X/5 stars (XXX reviews)
+   X.X/5 (XXX reviews)
    Price: $$ - Dine-in & delivery
    Web: <link>
    Menu: <link>
 
 2. LOCAL: <Name> - <Cuisine>
-   X/5 stars (XXX reviews)
-   Price: $$$ - Dine-in only
-   Web: <link>
-   Menu: <link>
+   ... same fields ...
 
 3. BEST RATED: <Name> - <Cuisine>
-   X/5 stars (XXX reviews)
-   Price: $$ - Takeout & delivery
-   Web: <link>
-   Menu: <link>
+   ... same fields ...
 
 Reply 1, 2, or 3 for address & directions!
 
-═══ DON'T ═══
-❌ Recommend McDonald's, A&W, etc. when local options exist
-❌ Leave menu blank — say "Not found online - call to ask"
-❌ Skip the new-restaurant warning when applicable`;
+═══ OUTPUT FORMAT — STATE B (widened) ═══
+No 4★+ <cuisine> within 5km of <neighbourhood> right now.
+Closest highly-rated spots:
 
-// ============================================================
-// AGENT: EVENT
-// ============================================================
-const EVENT_PROMPT = `You are PocketScout's Event Agent. You find local upcoming events, markets, fundraisers, and community happenings in the next 14 days.
+1. LOCAL: <Name> - <Cuisine> - <distance>km away
+   X.X/5 (XXX reviews)
+   Price: $$ - Dine-in & delivery
+   Web: <link>
+   Menu: <link>
+
+2. LOCAL: <Name> - <Cuisine> - <distance>km away
+   ... same fields ...
+
+3. BEST RATED: <Name> - <Cuisine> - <distance>km away
+   ... same fields ...
+
+Reply 1, 2, or 3 for address & directions!
+
+═══ OUTPUT FORMAT — STATE C (nothing qualifies) ═══
+No 4★+ <cuisine> spots found within 12km of <neighbourhood>.
+Want me to:
+- Lower the rating bar (reply LOWER)
+- Check a different neighbourhood (reply with the area)
+- See top spots citywide (reply CITYWIDE)
+
+═══ EXAMPLE — STATE A ═══
+User: "best pasta near Strathcona Calgary"
+Tool: google_places_search(query="Italian pasta restaurant", city="Calgary, AB", near="Strathcona", minRating: 4.0)
+Tool returns: widened=false, 4 places all 4.5+ stars within 5km.
+Reply:
+"Top 3 pasta spots near Strathcona!
+
+1. LOCAL: Trattoria Al Centro - Italian
+   4.8/5 (245 reviews)
+   Price: $$ - Dine-in & takeout
+   Web: trattoriaalcentro.ca
+   Menu: trattoriaalcentro.ca/menu
+
+2. LOCAL: Pasta La Vista - Italian
+   4.7/5 (180 reviews)
+   Price: $$ - Dine-in only
+   Web: pastalavista.ca
+   Menu: Not found online - call to ask
+
+3. BEST RATED: Nonna's Kitchen - Italian
+   4.9/5 (510 reviews)
+   Price: $$$ - Dine-in & delivery
+   Web: nonnaskitchen.ca
+   Menu: nonnaskitchen.ca/menu
+
+Reply 1, 2, or 3 for address & directions!"
+
+═══ EXAMPLE — STATE B (your scenario) ═══
+User: "best pasta near Strathcona Calgary"
+Tool: google_places_search(query="Italian pasta restaurant", city="Calgary, AB", near="Strathcona", minRating: 4.0)
+Tool returns: widened=true, 3 places 4.0+ but distances 7-10km.
+Reply:
+"No 4★+ pasta within 5km of Strathcona right now.
+Closest highly-rated spots:
+
+1. LOCAL: Posto Italian - Italian - 7.2km away
+   4.6/5 (340 reviews)
+   Price: $$$ - Dine-in & delivery
+   Web: postoitalian.ca
+   Menu: postoitalian.ca/menu
+
+2. LOCAL: Pulcinella - Italian - 8.1km away
+   4.7/5 (620 reviews)
+   Price: $$ - Dine-in & takeout
+   Web: pulcinella.ca
+   Menu: pulcinella.ca/menu
+
+3. BEST RATED: Cibo - Italian - 9.4km away
+   4.8/5 (890 reviews)
+   Price: $$$ - Dine-in only
+   Web: cibocalgary.com
+   Menu: cibocalgary.com/menu
+
+Reply 1, 2, or 3 for address & directions!"
+
+═══ EXAMPLE — STATE C ═══
+User: "best ethiopian near Banff"
+Tool returns: widened=true, places=[].
+Reply:
+"No 4★+ Ethiopian spots found within 12km of Banff.
+Want me to:
+- Lower the rating bar (reply LOWER)
+- Check Calgary instead (reply CALGARY)
+- See top restaurants citywide (reply CITYWIDE)"
+
+═══ DON'T ═══
+❌ Show 3-star spots when 4-star exist further away — widen instead
+❌ Show 3-star spots when nothing qualifies — be honest, ask the user
+❌ Hide that an option is 8km away — always show distance when widened
+❌ Skip \`near\` when user named an area
+❌ Recommend McDonald's or chains when locals are available`;
+
+const EVENT_PROMPT = `You are PocketScout's Event Agent.
 ${SHARED_RULES}
 
 ═══ HARD CONSTRAINTS ═══
-- ONLY show events in the FUTURE (verify the date is upcoming).
-- ONLY events within 14 days of today.
-- Return exactly 3 events.
+- ONLY future events.
+- ONLY events within 14 days.
+- Return exactly 3.
 - Highlight FREE events.
-- Prefer farmers markets, fundraisers, festivals, flea markets, pop-ups, charity events, art shows.
-
-═══ REASONING PROCESS ═══
-1. Confirm city.
-2. Search "<city> events this week" and "<city> farmers market <month>".
-3. For each candidate, VERIFY the date is in the future. If past, discard.
-4. Rank: free events first, then most community-oriented.
-5. Self-check. Reply.
+- Prefer farmers markets, fundraisers, festivals, pop-ups, charity events.
 
 ═══ OUTPUT FORMAT ═══
 Happening in <city> soon!
 1. <Event> - <Date> <Time> @ <Location> - <FREE or $XX>
 2. <Event> - <Date> <Time> @ <Location> - <FREE or $XX>
 3. <Event> - <Date> <Time> @ <Location> - <FREE or $XX>
-Reply 1, 2, or 3 for more details!
+Reply 1, 2, or 3 for more details!`;
 
-═══ EXAMPLE ═══
-User: "what's happening in Calgary this weekend"
-Reply:
-"Happening in Calgary soon!
-1. Crossroads Farmers Market - Sat 9am-3pm @ 1235 26 Ave SE - FREE
-2. YYC Vintage Pop-Up - Sun 11am-5pm @ Inglewood - FREE
-3. Calgary Folk Fest Fundraiser - Sat 7pm @ The Palace Theatre - $25
-Reply 1, 2, or 3 for more details!"
-
-═══ DON'T ═══
-❌ Show last week's market
-❌ Make up event names — if search returns nothing, say so
-❌ Forget the highlight on FREE events`;
-
-// ============================================================
-// AGENT: REVIEW
-// ============================================================
-const REVIEW_PROMPT = `You are PocketScout's Review Agent. You give honest, recent reviews on products, restaurants, stores, and services.
+const REVIEW_PROMPT = `You are PocketScout's Review Agent.
 ${SHARED_RULES}
 
 ═══ WORKFLOW ═══
-- For a BUSINESS: call google_places_search FIRST for real star rating + review count.
-  Then web_search for what recent reviewers are saying.
-- For a PRODUCT: web_search Trustpilot, Amazon.ca, Google Reviews, and Reddit
-  ("<product> review reddit canada").
+- Business: google_places_search FIRST (pass \`near\` if neighbourhood given).
+  Then web_search for recent reviews.
+- Product: web_search Trustpilot, Amazon.ca, Google Reviews, Reddit Canada.
 
 ═══ HARD CONSTRAINTS ═══
-- 6-MONTH RULE: Use only reviews from the last 6 months.
-- If fewer than 10 recent reviews, say "Not enough recent reviews to summarize - check Google directly."
-- NEW BUSINESS WARNING: If <50 total reviews OR business opened within 6 months, add:
-  "New business alert: Early reviews may include friends & family - take with a grain of salt."
+- 6-MONTH RULE.
+- <10 recent reviews → "Not enough recent reviews to summarize."
+- <50 total reviews OR opened within 6 months → new-business warning.
 
 ═══ OUTPUT FORMAT ═══
 <Name> Reviews - last 6 months
@@ -784,79 +1106,45 @@ Watch out for:
 - <complaint — 1 line>
 
 Verdict: <one honest sentence>
-Reviews pulled from last 6 months only
+Reviews pulled from last 6 months only`;
 
-═══ DON'T ═══
-❌ Quote reviews older than 6 months
-❌ Hide negative feedback to make a business look better
-❌ Skip the new-business warning when applicable`;
-
-// ============================================================
-// AGENT: FOLLOW-UP (NEW)
-//   Handles "1", "2", "3", "yes", "more", and city replies.
-//   Pulls context from conversation history — does NOT start fresh.
-// ============================================================
-const FOLLOWUP_PROMPT = `You are PocketScout's Follow-up Agent. The customer just replied to a previous PocketScout result — they want more detail on something already shown.
+const FOLLOWUP_PROMPT = `You are PocketScout's Follow-up Agent.
 ${SHARED_RULES}
 
 ═══ YOUR JOB ═══
-Look at the LAST assistant message in the conversation history. It contains the original 3-option result. The customer is now asking for one of:
-- "1", "2", or "3" → they want full details (address, phone, website, hours, link) on that specific option.
-- "YES" → they want the full breakdown (e.g., per-item grocery prices) of the previous result.
-- "MORE" → the previous reply was truncated; show them the rest.
-- A bare city name → they're answering a "which city are you in?" question. Save the city and re-run their original request.
-- Anything else short or ambiguous → ask one short clarifying question.
+The customer is replying to a previous result. Look at the LAST assistant message
+in history. Match their reply to:
+- "1", "2", "3" → full details (address, phone, hours, website).
+- "YES" → full breakdown (e.g. per-item grocery prices).
+- "MORE" → continue truncated reply.
+- A bare city/neighbourhood → answer to a "which area?" question. Save and re-run.
+- Anything else short → ask one short clarifying question.
 
-═══ REASONING PROCESS ═══
-1. Read the last assistant message carefully. What were the 3 options? What product/service/event was it?
-2. Match the user reply to one of the cases above.
-3. If "1", "2", or "3": web_search "<that store/restaurant/maker> <city> address phone hours" to get the full details.
-4. If "YES" on a grocery/recipe: list every item with its price at the chosen store.
-5. If "MORE": continue from where the truncated reply ended.
-6. Self-check. Reply.
-
-═══ OUTPUT FORMAT — option detail ═══
+═══ OUTPUT FORMAT (option detail) ═══
 <Name> details:
 📍 <full address>
 📞 <phone>
 🕐 <hours today>
 🌐 <website or order link>
 <one helpful tip if relevant>
-Want anything else scouted? 🔍
-
-═══ EXAMPLE — option detail ═══
-History last message: "Found winter boots in Calgary! 1. MADE IN CANADA: $189 - Baffin Tundra at Mark's ..."
-User: "1"
-Reply:
-"Mark's (Baffin Tundra $189):
-📍 Multiple Calgary locations - closest: 999 36 St NE
-📞 (403) 207-0000
-🕐 Today 9am-9pm
-🌐 marks.com
-Tip: Mark's price-matches Sport Chek if you ask at till.
-Want anything else scouted? 🔍"
-
-═══ DON'T ═══
-❌ Start a brand new search as if you'd never replied before
-❌ Ignore the conversation history
-❌ Miss the city — it should be in the previous message`;
+Want anything else scouted? 🔍`;
 
 // ============================================================
-// INTENT CLASSIFIER (with few-shot examples)
+// CLASSIFIER
 // ============================================================
-const CLASSIFIER_PROMPT = `Classify the user SMS into EXACTLY ONE category. Respond with ONLY the category name, nothing else.
+const CLASSIFIER_PROMPT = `Classify the user SMS into EXACTLY ONE category. Respond with ONLY the category name.
 
 Categories:
 - greeting — hi, hello, hey, what can you do, help, start, menu
 - product — ONE specific product to buy
-- grocery — a list of 2+ grocery/household items
+- grocery — list of 2+ grocery/household items
 - recipe — wants to cook or bake; mentions a dish
-- local_maker — homemade, handmade, artisan, crafts, handcrafted
-- service — mechanic, salon, massage, cleaner, daycare, groomer, tutor, handyman, plumber
+- local_maker — homemade, handmade, artisan, crafts
+- service — mechanic, salon, massage, cleaner, daycare, groomer, tutor, handyman
 - restaurant — food, places to eat, takeout, delivery, dinner, lunch
-- event — markets, festivals, fundraisers, events, things to do, what's happening
-- review — asking for reviews, ratings, "is X any good", "should I trust"
-- followup — short replies like "1", "2", "3", "yes", "more", a bare city name, "details please"
+- event — markets, festivals, fundraisers, things to do
+- review — reviews, ratings, "is X any good"
+- followup — "1", "2", "3", "yes", "more", a bare city/neighbourhood, "details"
 - other — truly unclear
 
 ═══ EXAMPLES ═══
@@ -865,14 +1153,16 @@ Categories:
 "winter boots" → product
 "baby formula in Calgary" → product
 "milk eggs bread chicken pasta sauce" → grocery
-"can you price my grocery list - apples, oats, peanut butter, yogurt" → grocery
+"price my list - apples oats peanut butter yogurt" → grocery
 "I want to make butter chicken tonight" → recipe
-"recipe for lasagna for 6 people" → recipe
+"recipe for lasagna for 6" → recipe
 "handmade leather wallet" → local_maker
 "someone making pottery in Edmonton" → local_maker
 "I need a mechanic" → service
-"good massage therapist near me" → service
+"good massage near me" → service
+"mechanic near Inglewood" → service
 "best ramen in Calgary" → restaurant
+"best pasta near Strathcona" → restaurant
 "where to eat downtown" → restaurant
 "what's happening this weekend" → event
 "farmers markets near me" → event
@@ -884,7 +1174,7 @@ Categories:
 "Calgary" → followup
 "Edmonton AB" → followup
 "option 2 please" → followup
-"tell me more about the third one" → followup
+"tell me about the third one" → followup
 "maybe later" → other
 "asdfgh" → other`;
 
@@ -912,33 +1202,35 @@ async function classifyIntent(message) {
 }
 
 // ============================================================
-// AGENT DISPATCHER
+// DISPATCHER
 // ============================================================
 const AGENT_CONFIG = {
-  product:     { prompt: PRODUCT_PROMPT,     tools: [WEB_SEARCH_TOOL],                       maxTurns: 6 },
-  grocery:     { prompt: GROCERY_PROMPT,     tools: [WEB_SEARCH_TOOL],                       maxTurns: 10 },
-  recipe:      { prompt: RECIPE_PROMPT,      tools: [WEB_SEARCH_TOOL],                       maxTurns: 8  },
-  local_maker: { prompt: LOCAL_MAKER_PROMPT, tools: [WEB_SEARCH_TOOL],                       maxTurns: 6  },
-  service:     { prompt: SERVICE_PROMPT,     tools: [WEB_SEARCH_TOOL, GOOGLE_PLACES_TOOL],   maxTurns: 6  },
-  restaurant:  { prompt: RESTAURANT_PROMPT,  tools: [WEB_SEARCH_TOOL, GOOGLE_PLACES_TOOL],   maxTurns: 7  },
-  event:       { prompt: EVENT_PROMPT,       tools: [WEB_SEARCH_TOOL],                       maxTurns: 6  },
-  review:      { prompt: REVIEW_PROMPT,      tools: [WEB_SEARCH_TOOL, GOOGLE_PLACES_TOOL],   maxTurns: 6  },
-  followup:    { prompt: FOLLOWUP_PROMPT,    tools: [WEB_SEARCH_TOOL],                       maxTurns: 4  },
-  // "other" gets the follow-up agent — at least it has conversation context
-  other:       { prompt: FOLLOWUP_PROMPT,    tools: [WEB_SEARCH_TOOL],                       maxTurns: 4  },
+  product:     { prompt: PRODUCT_PROMPT,     tools: [WEB_SEARCH_TOOL],                     maxTurns: 6 },
+  grocery:     { prompt: GROCERY_PROMPT,     tools: [WEB_SEARCH_TOOL],                     maxTurns: 10 },
+  recipe:      { prompt: RECIPE_PROMPT,      tools: [WEB_SEARCH_TOOL],                     maxTurns: 8  },
+  local_maker: { prompt: LOCAL_MAKER_PROMPT, tools: [WEB_SEARCH_TOOL],                     maxTurns: 6  },
+  service:     { prompt: SERVICE_PROMPT,     tools: [WEB_SEARCH_TOOL, GOOGLE_PLACES_TOOL], maxTurns: 6  },
+  restaurant:  { prompt: RESTAURANT_PROMPT,  tools: [WEB_SEARCH_TOOL, GOOGLE_PLACES_TOOL], maxTurns: 7  },
+  event:       { prompt: EVENT_PROMPT,       tools: [WEB_SEARCH_TOOL],                     maxTurns: 6  },
+  review:      { prompt: REVIEW_PROMPT,      tools: [WEB_SEARCH_TOOL, GOOGLE_PLACES_TOOL], maxTurns: 6  },
+  followup:    { prompt: FOLLOWUP_PROMPT,    tools: [WEB_SEARCH_TOOL],                     maxTurns: 4  },
+  other:       { prompt: FOLLOWUP_PROMPT,    tools: [WEB_SEARCH_TOOL],                     maxTurns: 4  },
 };
 
 async function routeAndRun(phone, userMessage) {
   const state = getState(phone);
 
-  // Update saved city if this message contains one
   const detectedCity = extractCity(userMessage);
   if (detectedCity) state.city = detectedCity;
 
-  const intent = await classifyIntent(userMessage);
-  console.log(`[${phone}] intent: ${intent} | city: ${state.city || "?"}`);
+  const detectedNeighbourhood = extractNeighbourhood(userMessage);
+  if (detectedNeighbourhood) state.neighbourhood = detectedNeighbourhood;
 
-  // Greeting — canned reply, no AI call
+  const intent = await classifyIntent(userMessage);
+  console.log(
+    `[${phone}] intent=${intent} city=${state.city || "?"} hood=${state.neighbourhood || "-"}`
+  );
+
   if (intent === "greeting") {
     state.messages.push({ role: "user", content: userMessage });
     state.messages.push({ role: "assistant", content: GREETING_RESPONSE });
@@ -947,12 +1239,15 @@ async function routeAndRun(phone, userMessage) {
     return { text: GREETING_RESPONSE, needsAck: false, intent };
   }
 
-  // If user replied with just a city name and we have a previous intent that needed one, re-run it
-  if (intent === "followup" && detectedCity && state.lastIntent && state.lastIntent !== "greeting") {
+  if (
+    intent === "followup" &&
+    detectedCity &&
+    state.lastIntent &&
+    state.lastIntent !== "greeting"
+  ) {
     const previousUserMsg =
       [...state.messages].reverse().find((m) => m.role === "user")?.content || "";
     userMessage = `${previousUserMsg} in ${detectedCity}`;
-    // Use the original agent for this re-run, not the followup agent
     const config = AGENT_CONFIG[state.lastIntent] || AGENT_CONFIG.product;
     const result = await runAgent({
       systemPrompt: config.prompt,
@@ -971,11 +1266,15 @@ async function routeAndRun(phone, userMessage) {
     };
   }
 
-  // Inject saved city into the user message so the agent sees it
   let enrichedMessage = userMessage;
+  const additions = [];
   if (state.city && !detectedCity && intent !== "followup") {
-    enrichedMessage = `${userMessage} (city: ${state.city})`;
+    additions.push(`city: ${state.city}`);
   }
+  if (state.neighbourhood && !detectedNeighbourhood && intent !== "followup") {
+    additions.push(`near: ${state.neighbourhood}`);
+  }
+  if (additions.length) enrichedMessage = `${userMessage} (${additions.join(", ")})`;
 
   const config = AGENT_CONFIG[intent] || AGENT_CONFIG.other;
   const isFollowUp = intent === "followup" || intent === "other";
@@ -995,17 +1294,24 @@ async function routeAndRun(phone, userMessage) {
   saveState(phone, state);
 
   const text = result.text || "Scout couldn't find that one - try rephrasing and I'll look again!";
+
+  const tierCheck = checkScoutTiers(intent, text);
+  if (!tierCheck.ok) {
+    console.warn(`[${phone}] ⚠ Scout Tier issues:`, tierCheck.issues);
+  }
+
   return {
     text,
     needsAck: !isFollowUp,
     intent,
     cacheReadTokens: result.cacheReadTokens,
     cacheCreateTokens: result.cacheCreateTokens,
+    tierIssues: tierCheck.ok ? null : tierCheck.issues,
   };
 }
 
 // ============================================================
-// SMS TRIMMER + SENDER
+// SMS SENDER
 // ============================================================
 function trimToLimit(text) {
   if (text.length <= TWILIO_MAX_CHARS) return text;
@@ -1025,15 +1331,14 @@ async function sendSms(to, body) {
 }
 
 // ============================================================
-// TWILIO SIGNATURE VALIDATION
+// SECURITY MIDDLEWARE
 // ============================================================
 function validateTwilioSignature(req, res, next) {
   if (process.env.SKIP_TWILIO_VALIDATION === "true") return next();
-
   const twilioSignature = req.headers["x-twilio-signature"];
   const url = process.env.TWILIO_WEBHOOK_URL;
   if (!twilioSignature || !url) {
-    console.warn("Missing Twilio signature header or TWILIO_WEBHOOK_URL env var");
+    console.warn("Missing Twilio signature header or TWILIO_WEBHOOK_URL");
     return res.status(403).send("Forbidden");
   }
   const valid = twilio.validateRequest(
@@ -1042,20 +1347,14 @@ function validateTwilioSignature(req, res, next) {
     url,
     req.body
   );
-  if (!valid) {
-    console.warn("Invalid Twilio signature - request rejected");
-    return res.status(403).send("Forbidden");
-  }
+  if (!valid) return res.status(403).send("Forbidden");
   next();
 }
 
-// ============================================================
-// ADMIN AUTH
-// ============================================================
 function requireAdminKey(req, res, next) {
   const key = req.headers["x-admin-key"] || req.query.key;
   if (!process.env.ADMIN_KEY) {
-    return res.status(503).json({ error: "Admin key not configured on server" });
+    return res.status(503).json({ error: "Admin key not configured" });
   }
   if (!key || key !== process.env.ADMIN_KEY) {
     return res.status(403).json({ error: "Forbidden" });
@@ -1084,7 +1383,6 @@ app.post("/sms", validateTwilioSignature, async (req, res) => {
 
   enqueueForUser(fromNumber, async () => {
     await acquireSlot();
-
     try {
       const reply = await routeAndRun(fromNumber, incomingMsg);
 
@@ -1099,7 +1397,7 @@ app.post("/sms", validateTwilioSignature, async (req, res) => {
       const durationMs = Date.now() - startedAt;
       console.log(
         `[${fromNumber}] <- sent (${reply.text.length} chars, ${durationMs}ms, ` +
-          `cache_read=${reply.cacheReadTokens || 0}, cache_create=${reply.cacheCreateTokens || 0})`
+          `cache_read=${reply.cacheReadTokens || 0}, tier_ok=${reply.tierIssues ? "no" : "yes"})`
       );
 
       logInteraction({
@@ -1110,17 +1408,14 @@ app.post("/sms", validateTwilioSignature, async (req, res) => {
         durationMs,
         cacheReadTokens: reply.cacheReadTokens || 0,
         cacheCreateTokens: reply.cacheCreateTokens || 0,
+        tierIssues: reply.tierIssues,
       });
     } catch (err) {
       console.error(`Error [${fromNumber}]:`, err.message);
       try {
         await sendSms(fromNumber, "Scout hit a snag - try again in a moment!");
       } catch (_) {}
-      logInteraction({
-        phone: fromNumber,
-        in: incomingMsg,
-        error: err.message,
-      });
+      logInteraction({ phone: fromNumber, in: incomingMsg, error: err.message });
     } finally {
       releaseSlot();
     }
@@ -1130,12 +1425,13 @@ app.post("/sms", validateTwilioSignature, async (req, res) => {
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    service: "PocketScout v2",
+    service: "PocketScout v4",
     activeConversations: conversations.size,
     activeAiCalls: activeCount,
     waitingInQueue: waitingQueue.length,
     googlePlacesEnabled: !!process.env.GOOGLE_PLACES_API_KEY,
     twilioValidationEnabled: process.env.SKIP_TWILIO_VALIDATION !== "true",
+    geocodeCacheSize: geocodeCache.size,
     logDir: LOG_DIR,
   });
 });
@@ -1146,25 +1442,17 @@ app.delete("/conversation/:phone", requireAdminKey, (req, res) => {
   res.json({ cleared: phone, existed });
 });
 
-// ============================================================
-// START
-// ============================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`
   ╔══════════════════════════════════════╗
-  ║  PocketScout SMS Server v2           ║
-  ║  Listening on port ${String(PORT).padEnd(18)}║
-  ║  POST /sms  -> Twilio webhook        ║
-  ║  GET  /health -> status check        ║
-  ╠══════════════════════════════════════╣
-  ║  Agents: greeting, product, grocery, ║
-  ║   recipe, local_maker, service,      ║
-  ║   restaurant, event, review, followup║
+  ║  PocketScout SMS Server v4           ║
+  ║  Port: ${String(PORT).padEnd(30)}║
+  ║  Quality fallback: ON (4.0★ / 12km)  ║
+  ║  Neighbourhood-aware: 5km radius     ║
+  ║  Scout Tier safety check: ON         ║
   ║  Prompt caching: ON                  ║
-  ║  Query logging: ${LOG_DIR.padEnd(21)}║
-  ║  Google Places: ${(process.env.GOOGLE_PLACES_API_KEY ? "ENABLED " : "DISABLED").padEnd(21)}║
-  ║  Twilio validation: ${(process.env.SKIP_TWILIO_VALIDATION === "true" ? "OFF " : "ON  ").padEnd(17)}║
+  ║  Logs: ${LOG_DIR.padEnd(30)}║
   ╚══════════════════════════════════════╝
   `);
 });

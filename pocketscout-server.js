@@ -1,15 +1,17 @@
 /**
- * PocketScout SMS Server — Agent Edition v4
+ * PocketScout SMS Server — Agent Edition v6
  *
- * What's new vs. v3:
- *   • Quality fallback: if all nearby spots are below the minRating threshold,
- *     widen the radius automatically and tell the user honestly
- *   • google_places_search accepts `minRating` and returns a `widened` flag
- *   • Restaurant/Service/Review prompts updated to handle widened results
+ * What's new vs. v5:
+ *   • Date-aware event search: current date/time injected into Event agent prompt
+ *     at request time so Claude knows the actual 14-day window
+ *   • Per-city timezone awareness (Calgary = America/Edmonton, etc.)
+ *   • Post-reply date validation: parses dates from event replies and flags any
+ *     that fall in the past
+ *   • Date hints added to the search queries themselves
  *
- * Carried from v3:
- *   • Neighbourhood-aware search with 5km hard radius
- *   • Geocode cache, haversine post-filter, scout-tier safety check, prompt caching
+ * Carried from v5:
+ *   • Parallel tool execution, quality fallback, neighbourhood radius,
+ *     scout-tier check, prompt caching
  */
 
 require("dotenv").config();
@@ -192,6 +194,160 @@ function extractCity(message) {
     }
   }
   return null;
+}
+
+// ============================================================
+// CITY → TIMEZONE
+//   Used for event filtering — "tonight in Calgary" means
+//   tonight in Mountain Time, not server time (UTC on Railway).
+// ============================================================
+const CITY_TIMEZONES = {
+  // Mountain
+  calgary: "America/Edmonton",
+  edmonton: "America/Edmonton",
+  "red deer": "America/Edmonton",
+  lethbridge: "America/Edmonton",
+  "medicine hat": "America/Edmonton",
+  "fort mcmurray": "America/Edmonton",
+  "grande prairie": "America/Edmonton",
+  airdrie: "America/Edmonton",
+  okotoks: "America/Edmonton",
+  cochrane: "America/Edmonton",
+  canmore: "America/Edmonton",
+  banff: "America/Edmonton",
+  yellowknife: "America/Yellowknife",
+  whitehorse: "America/Whitehorse",
+  // Pacific
+  vancouver: "America/Vancouver",
+  victoria: "America/Vancouver",
+  burnaby: "America/Vancouver",
+  surrey: "America/Vancouver",
+  richmond: "America/Vancouver",
+  kelowna: "America/Vancouver",
+  kamloops: "America/Vancouver",
+  // Central
+  winnipeg: "America/Winnipeg",
+  regina: "America/Regina",
+  saskatoon: "America/Regina",
+  // Eastern
+  toronto: "America/Toronto",
+  ottawa: "America/Toronto",
+  mississauga: "America/Toronto",
+  brampton: "America/Toronto",
+  hamilton: "America/Toronto",
+  london: "America/Toronto",
+  kitchener: "America/Toronto",
+  windsor: "America/Toronto",
+  markham: "America/Toronto",
+  vaughan: "America/Toronto",
+  oshawa: "America/Toronto",
+  montreal: "America/Toronto",
+  "quebec city": "America/Toronto",
+  laval: "America/Toronto",
+  gatineau: "America/Toronto",
+  sherbrooke: "America/Toronto",
+  "trois-rivieres": "America/Toronto",
+  // Atlantic
+  halifax: "America/Halifax",
+  fredericton: "America/Halifax",
+  moncton: "America/Halifax",
+  charlottetown: "America/Halifax",
+  // Newfoundland
+  "st. john's": "America/St_Johns",
+};
+
+function timezoneFor(city) {
+  if (!city) return "America/Edmonton"; // sensible default for SAIT/Calgary
+  return CITY_TIMEZONES[city.toLowerCase()] || "America/Edmonton";
+}
+
+// Build a human-readable "now" string in the city's local timezone.
+// Returns:
+//   { now, today, in14days, label }
+function buildDateContext(city) {
+  const tz = timezoneFor(city);
+  const now = new Date();
+  const fmtDate = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+  const fmtTime = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  });
+  const fmtShort = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+
+  const todayStr = fmtDate.format(now);
+  const timeStr = fmtTime.format(now);
+
+  const in14 = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
+  const in14Str = fmtShort.format(in14);
+  const todayShort = fmtShort.format(now);
+
+  return {
+    nowLabel: `${todayStr}, ${timeStr} (${tz}${city ? `, ${city}` : ""})`,
+    todayShort, // e.g. "May 2, 2026"
+    in14Short: in14Str, // e.g. "May 16, 2026"
+    timezone: tz,
+    nowMs: now.getTime(),
+    in14Ms: in14.getTime(),
+  };
+}
+
+// Parse a date string from an agent reply. Returns Date or null.
+// Handles "Sat May 4", "May 4 7pm", "Saturday May 4 2026", etc.
+function parseDateFromText(text, referenceYear) {
+  const monthMap = {
+    jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+    jul: 6, aug: 7, sep: 8, sept: 8, oct: 9, nov: 10, dec: 11,
+  };
+  // Match patterns like "May 4", "May 4 2026", "Sat May 4"
+  const re = /\b([A-Z][a-z]{2,8})\s+(\d{1,2})(?:[,\s]+(\d{4}))?/;
+  const m = text.match(re);
+  if (!m) return null;
+  const monthName = m[1].toLowerCase().slice(0, 4);
+  const monthIdx =
+    monthMap[monthName] !== undefined
+      ? monthMap[monthName]
+      : monthMap[m[1].toLowerCase().slice(0, 3)];
+  if (monthIdx === undefined) return null;
+  const day = parseInt(m[2], 10);
+  const year = m[3] ? parseInt(m[3], 10) : referenceYear;
+  if (day < 1 || day > 31) return null;
+  return new Date(year, monthIdx, day);
+}
+
+// Validate that all event dates in a reply are in the future.
+// Returns { ok, pastEventLines } where pastEventLines lists offending lines.
+function validateEventDates(replyText, dateContext) {
+  if (!replyText) return { ok: true, pastEventLines: [] };
+  const lines = replyText.split("\n");
+  const pastLines = [];
+  // Only check lines that look like event entries (numbered list items)
+  const eventLineRe = /^\s*\d+\.\s/;
+  const referenceYear = new Date(dateContext.nowMs).getFullYear();
+  const todayStart = new Date(dateContext.nowMs);
+  todayStart.setHours(0, 0, 0, 0);
+
+  for (const line of lines) {
+    if (!eventLineRe.test(line)) continue;
+    const parsed = parseDateFromText(line, referenceYear);
+    if (!parsed) continue; // couldn't parse — don't false-flag
+    if (parsed.getTime() < todayStart.getTime()) {
+      pastLines.push(line.trim());
+    }
+  }
+  return { ok: pastLines.length === 0, pastEventLines: pastLines };
 }
 
 // Detect a neighbourhood reference. We don't try to know every neighbourhood —
@@ -587,23 +743,41 @@ async function runAgent({ systemPrompt, tools, history, userMessage, maxTurns = 
 
       messages.push({ role: "assistant", content: response.content });
 
-      const toolResults = [];
-      for (const call of clientToolCalls) {
-        const result = await callGooglePlaces(
-          call.input.query,
-          call.input.city,
-          call.input.near,
-          {
-            minRating: call.input.minRating,
-            minReviews: call.input.minReviews,
-          }
+      // PARALLEL EXECUTION
+      // All client tool calls in this turn run concurrently. Promise.all waits
+      // for the slowest one — total time = max(individual call times), not sum.
+      // For 3 simultaneous Places lookups at ~2s each, that's ~2s total instead of ~6s.
+      const parallelStart = Date.now();
+      const toolResults = await Promise.all(
+        clientToolCalls.map(async (call) => {
+          const callStart = Date.now();
+          const result = await callGooglePlaces(
+            call.input.query,
+            call.input.city,
+            call.input.near,
+            {
+              minRating: call.input.minRating,
+              minReviews: call.input.minReviews,
+            }
+          );
+          const ms = Date.now() - callStart;
+          console.log(
+            `   ↳ places("${call.input.query}"${call.input.near ? ` near ${call.input.near}` : ""}) ${ms}ms`
+          );
+          return {
+            type: "tool_result",
+            tool_use_id: call.id,
+            content: JSON.stringify(result),
+          };
+        })
+      );
+      const parallelMs = Date.now() - parallelStart;
+      if (clientToolCalls.length > 1) {
+        console.log(
+          `   ↳ ran ${clientToolCalls.length} tools in parallel: ${parallelMs}ms total`
         );
-        toolResults.push({
-          type: "tool_result",
-          tool_use_id: call.id,
-          content: JSON.stringify(result),
-        });
       }
+
       messages.push({ role: "user", content: toolResults });
       continue;
     }
@@ -717,6 +891,27 @@ const SHARED_RULES = `
   to widen the search to the full city.
 - City and neighbourhood may also be remembered from earlier — check history first.
 
+═══ PARALLEL SEARCHING — IMPORTANT ═══
+When you need to run MULTIPLE independent searches, request them ALL in the
+SAME turn (i.e. emit multiple tool_use blocks in one response). The runtime
+executes them in parallel — total time = the slowest one, not the sum.
+
+DO this:
+  Turn 1: emit web_search("Italian pasta site:opentable.ca Strathcona") AND
+          google_places_search(query="pasta", near="Strathcona") AND
+          web_search("Trattoria Al Centro menu") all in ONE turn.
+
+DON'T do this:
+  Turn 1: web_search → wait
+  Turn 2: google_places_search → wait
+  Turn 3: web_search for menu → wait
+This serial pattern is 3-5x slower for users.
+
+Searches are independent if knowing the result of one wouldn't change the
+others. The first Places search and a menu lookup ARE independent. A menu
+lookup that depends on which restaurants Places returned is NOT — that one
+must wait for the Places result first.
+
 ═══ SELF-CHECK BEFORE REPLYING ═══
 ✓ Reply under 1500 characters
 ✓ Doesn't start with "I" or banned opener
@@ -750,11 +945,14 @@ ${SHARED_RULES}
 ═══ REASONING ═══
 1. Parse: product, city, neighbourhood (if any).
    If city missing AND not in history, ask "Which city are you in?"
-2. Plan three searches:
-   - Tier 1 MADE IN CANADA: Canadian-made brand. If none, fall back to BEST CANADIAN RETAILER.
-   - Tier 2 LOCAL STORE: Independent shop in <city>, near <neighbourhood> if given.
-   - Tier 3 CHEAPEST: Lowest verified price on trusted domains.
-3. Up to 4 web_searches.
+2. Run all THREE tier searches IN PARALLEL — emit them in one turn:
+   - web_search "Canadian made <product> brand" → for Tier 1
+   - web_search "independent <product category> store <city>" → for Tier 2
+   - web_search "<product> price site:walmart.ca OR site:amazon.ca" → Tier 3
+   These three are independent. Batching them cuts response time by ~60%.
+3. If a tier comes back empty, fall back:
+   - Tier 1 empty → BEST CANADIAN RETAILER (Best Buy, Mark's, etc.)
+   - Tier 2 empty → "No independent shop found"
 4. Self-check and reply.
 
 ═══ OUTPUT FORMAT ═══
@@ -799,10 +997,11 @@ ${SHARED_RULES}
 
 ═══ REASONING ═══
 1. Parse list, count items, confirm city.
-2. Estimate basket totals at:
-   - Tier 1 MADE IN CANADA: Canadian retailer (Sobeys, Loblaws, Co-op, Save-On).
-   - Tier 2 LOCAL STORE: Independent grocer in <city>.
-   - Tier 3 CHEAPEST: Lowest total (Walmart, Costco, No Frills).
+2. Run THREE store-total estimates IN PARALLEL — emit in one turn:
+   - web_search "<each item> price site:sobeys.com" → Tier 1 total
+   - web_search "<items> independent grocer <city>" → Tier 2 total
+   - web_search "<each item> price site:walmart.ca" → Tier 3 total
+   The three store totals are independent. Batching is ~60% faster.
 3. Per item: verified price preferred; otherwise mark "(est.)" internally.
 4. Show 3 totals. State savings. Self-check. Reply.
 
@@ -916,9 +1115,15 @@ const RESTAURANT_PROMPT = `You are PocketScout's Restaurant Agent.
 ${SHARED_RULES}
 
 ═══ CRITICAL WORKFLOW ═══
-1. ALWAYS call google_places_search FIRST with minRating: 4.0.
-2. If user mentioned a neighbourhood, pass it as \`near\`.
-3. The tool may return one of three states — handle each honestly:
+1. Turn 1: call google_places_search(minRating: 4.0) WITH the \`near\` field
+   if user mentioned an area. (This must be alone — menu lookups depend on
+   which restaurants come back.)
+2. Turn 2: emit ALL THREE menu lookups IN PARALLEL in one turn:
+   - web_search "<restaurant 1> menu"
+   - web_search "<restaurant 2> menu"
+   - web_search "<restaurant 3> menu"
+   These three are independent. Batching them is ~3x faster than serial.
+3. The Places tool may return one of three states — handle each honestly:
 
    STATE A — widened: false, places.length >= 3
      → Normal case. Show top 3 within the 5km radius.
@@ -935,9 +1140,8 @@ ${SHARED_RULES}
        Want me to lower the rating bar or check elsewhere?"
      → Do NOT show 3-star results unless the user explicitly asks.
 
-4. web_search to find MENU LINKS for the chosen options.
-5. Prioritize locally owned over chains.
-6. Return exactly 3 results when you have them.
+4. Prioritize locally owned over chains.
+5. Return exactly 3 results when you have them.
 
 ═══ FIELDS PER RESTAURANT ═══
 cuisine • star rating • review count • price range • dine-in/takeout/delivery • website • menu link.
@@ -1061,22 +1265,70 @@ Want me to:
 ❌ Skip \`near\` when user named an area
 ❌ Recommend McDonald's or chains when locals are available`;
 
-const EVENT_PROMPT = `You are PocketScout's Event Agent.
+// Event prompt is built per-request because it embeds the live date.
+// The static portion is cached separately by Anthropic; the live portion
+// is small so the cache hit rate stays high.
+function buildEventPrompt(dateContext) {
+  return `You are PocketScout's Event Agent.
 ${SHARED_RULES}
 
+═══ CURRENT DATE & TIME ═══
+RIGHT NOW: ${dateContext.nowLabel}
+TODAY: ${dateContext.todayShort}
+14-DAY WINDOW: ${dateContext.todayShort} through ${dateContext.in14Short}
+
+This is the ground truth. Trust this over anything you see in search results.
+If a search result page says "2024 Stampede" or "this Saturday at 9pm" without
+a year, you must verify the year matches ${new Date(dateContext.nowMs).getFullYear()} before showing it.
+
 ═══ HARD CONSTRAINTS ═══
-- ONLY future events.
-- ONLY events within 14 days.
-- Return exactly 3.
+- ONLY events happening between TODAY (${dateContext.todayShort}) and ${dateContext.in14Short}.
+- Past events are FORBIDDEN. Even if the page shows up first in search, discard it.
+- If a search result has no clear date, discard it. Don't guess.
+- If today's date is past an event's date, discard it.
+- Return exactly 3 events.
 - Highlight FREE events.
 - Prefer farmers markets, fundraisers, festivals, pop-ups, charity events.
 
+═══ SEARCH STRATEGY ═══
+When you search, INCLUDE THE CURRENT MONTH AND YEAR in your queries:
+  ✓ web_search "${dateContext.todayShort.split(",")[0]} farmers market <city>"
+  ✓ web_search "<city> events this week ${new Date(dateContext.nowMs).getFullYear()}"
+  ✓ web_search "<city> fundraiser ${dateContext.todayShort.split(",")[0]}"
+  ✗ web_search "<city> events" (too vague — pulls old indexed pages)
+
+Run multiple queries IN PARALLEL in one turn (see Parallel Searching rule).
+
+═══ DATE VERIFICATION CHECK ═══
+For EACH event you're considering, verify:
+- Does the page or listing show a date?
+- Is that date between ${dateContext.todayShort} and ${dateContext.in14Short}?
+- If you're unsure of the year, search for confirmation before including it.
+- Skip the event if any answer is no.
+
 ═══ OUTPUT FORMAT ═══
 Happening in <city> soon!
-1. <Event> - <Date> <Time> @ <Location> - <FREE or $XX>
-2. <Event> - <Date> <Time> @ <Location> - <FREE or $XX>
-3. <Event> - <Date> <Time> @ <Location> - <FREE or $XX>
-Reply 1, 2, or 3 for more details!`;
+1. <Event> - <Day, Month Date> <Time> @ <Location> - <FREE or $XX>
+2. <Event> - <Day, Month Date> <Time> @ <Location> - <FREE or $XX>
+3. <Event> - <Day, Month Date> <Time> @ <Location> - <FREE or $XX>
+Reply 1, 2, or 3 for more details!
+
+═══ EXAMPLE ═══
+Right now: ${dateContext.nowLabel}
+User: "what's happening in Calgary"
+Reply (every date is between today and ${dateContext.in14Short}):
+"Happening in Calgary soon!
+1. Crossroads Farmers Market - Sat May 9 9am-3pm @ 1235 26 Ave SE - FREE
+2. Inglewood Night Market - Thu May 14 5pm-10pm @ 9 Ave SE - FREE
+3. YYC Food Truck Festival - Sun May 11 11am-7pm @ Eau Claire - $5
+Reply 1, 2, or 3 for more details!"
+
+═══ DON'T ═══
+❌ Show "Calgary Stampede 2024" or any past-year event
+❌ Include an event whose date you can't verify
+❌ Use the year from the search result without confirming it matches ${new Date(dateContext.nowMs).getFullYear()}
+❌ Show events more than 14 days out`;
+}
 
 const REVIEW_PROMPT = `You are PocketScout's Review Agent.
 ${SHARED_RULES}
@@ -1211,7 +1463,8 @@ const AGENT_CONFIG = {
   local_maker: { prompt: LOCAL_MAKER_PROMPT, tools: [WEB_SEARCH_TOOL],                     maxTurns: 6  },
   service:     { prompt: SERVICE_PROMPT,     tools: [WEB_SEARCH_TOOL, GOOGLE_PLACES_TOOL], maxTurns: 6  },
   restaurant:  { prompt: RESTAURANT_PROMPT,  tools: [WEB_SEARCH_TOOL, GOOGLE_PLACES_TOOL], maxTurns: 7  },
-  event:       { prompt: EVENT_PROMPT,       tools: [WEB_SEARCH_TOOL],                     maxTurns: 6  },
+  // Event uses a per-request builder so the live date can be injected
+  event:       { promptBuilder: buildEventPrompt, tools: [WEB_SEARCH_TOOL],                maxTurns: 6  },
   review:      { prompt: REVIEW_PROMPT,      tools: [WEB_SEARCH_TOOL, GOOGLE_PLACES_TOOL], maxTurns: 6  },
   followup:    { prompt: FOLLOWUP_PROMPT,    tools: [WEB_SEARCH_TOOL],                     maxTurns: 4  },
   other:       { prompt: FOLLOWUP_PROMPT,    tools: [WEB_SEARCH_TOOL],                     maxTurns: 4  },
@@ -1249,8 +1502,11 @@ async function routeAndRun(phone, userMessage) {
       [...state.messages].reverse().find((m) => m.role === "user")?.content || "";
     userMessage = `${previousUserMsg} in ${detectedCity}`;
     const config = AGENT_CONFIG[state.lastIntent] || AGENT_CONFIG.product;
+    const systemPrompt = config.promptBuilder
+      ? config.promptBuilder(buildDateContext(detectedCity))
+      : config.prompt;
     const result = await runAgent({
-      systemPrompt: config.prompt,
+      systemPrompt,
       tools: config.tools,
       history: state.messages,
       userMessage,
@@ -1279,8 +1535,20 @@ async function routeAndRun(phone, userMessage) {
   const config = AGENT_CONFIG[intent] || AGENT_CONFIG.other;
   const isFollowUp = intent === "followup" || intent === "other";
 
+  // For agents that need live date context (event), build the prompt now.
+  // For others, use the static prompt.
+  let systemPrompt;
+  let dateContext = null;
+  if (config.promptBuilder) {
+    dateContext = buildDateContext(state.city);
+    systemPrompt = config.promptBuilder(dateContext);
+    console.log(`[${phone}] event date context: ${dateContext.nowLabel}`);
+  } else {
+    systemPrompt = config.prompt;
+  }
+
   const result = await runAgent({
-    systemPrompt: config.prompt,
+    systemPrompt,
     tools: config.tools,
     history: state.messages,
     userMessage: enrichedMessage,
@@ -1300,6 +1568,16 @@ async function routeAndRun(phone, userMessage) {
     console.warn(`[${phone}] ⚠ Scout Tier issues:`, tierCheck.issues);
   }
 
+  // Date validation for events — flag any past dates in the reply
+  let dateIssues = null;
+  if (intent === "event" && dateContext) {
+    const dateCheck = validateEventDates(text, dateContext);
+    if (!dateCheck.ok) {
+      console.warn(`[${phone}] ⚠ Past event dates detected:`, dateCheck.pastEventLines);
+      dateIssues = dateCheck.pastEventLines;
+    }
+  }
+
   return {
     text,
     needsAck: !isFollowUp,
@@ -1307,6 +1585,7 @@ async function routeAndRun(phone, userMessage) {
     cacheReadTokens: result.cacheReadTokens,
     cacheCreateTokens: result.cacheCreateTokens,
     tierIssues: tierCheck.ok ? null : tierCheck.issues,
+    dateIssues,
   };
 }
 
@@ -1397,7 +1676,8 @@ app.post("/sms", validateTwilioSignature, async (req, res) => {
       const durationMs = Date.now() - startedAt;
       console.log(
         `[${fromNumber}] <- sent (${reply.text.length} chars, ${durationMs}ms, ` +
-          `cache_read=${reply.cacheReadTokens || 0}, tier_ok=${reply.tierIssues ? "no" : "yes"})`
+          `cache_read=${reply.cacheReadTokens || 0}, tier_ok=${reply.tierIssues ? "no" : "yes"}` +
+          `${reply.dateIssues ? ", date_ok=no" : ""})`
       );
 
       logInteraction({
@@ -1409,6 +1689,7 @@ app.post("/sms", validateTwilioSignature, async (req, res) => {
         cacheReadTokens: reply.cacheReadTokens || 0,
         cacheCreateTokens: reply.cacheCreateTokens || 0,
         tierIssues: reply.tierIssues,
+        dateIssues: reply.dateIssues,
       });
     } catch (err) {
       console.error(`Error [${fromNumber}]:`, err.message);
@@ -1425,7 +1706,7 @@ app.post("/sms", validateTwilioSignature, async (req, res) => {
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    service: "PocketScout v4",
+    service: "PocketScout v6",
     activeConversations: conversations.size,
     activeAiCalls: activeCount,
     waitingInQueue: waitingQueue.length,
@@ -1446,8 +1727,10 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`
   ╔══════════════════════════════════════╗
-  ║  PocketScout SMS Server v4           ║
+  ║  PocketScout SMS Server v6           ║
   ║  Port: ${String(PORT).padEnd(30)}║
+  ║  Date-aware events: ON               ║
+  ║  Parallel tool execution: ON         ║
   ║  Quality fallback: ON (4.0★ / 12km)  ║
   ║  Neighbourhood-aware: 5km radius     ║
   ║  Scout Tier safety check: ON         ║

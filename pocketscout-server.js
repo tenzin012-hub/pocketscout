@@ -1290,14 +1290,24 @@ a year, you must verify the year matches ${new Date(dateContext.nowMs).getFullYe
 - Highlight FREE events.
 - Prefer farmers markets, fundraisers, festivals, pop-ups, charity events.
 
-═══ SEARCH STRATEGY ═══
-When you search, INCLUDE THE CURRENT MONTH AND YEAR in your queries:
-  ✓ web_search "${dateContext.todayShort.split(",")[0]} farmers market <city>"
-  ✓ web_search "<city> events this week ${new Date(dateContext.nowMs).getFullYear()}"
-  ✓ web_search "<city> fundraiser ${dateContext.todayShort.split(",")[0]}"
-  ✗ web_search "<city> events" (too vague — pulls old indexed pages)
+═══ SEARCH STRATEGY — RUN IN PARALLEL ═══
+Event searches are ALL independent. ALWAYS emit multiple web_search tool calls
+in the SAME turn. Run 4-5 searches in parallel for ~4x speedup vs serial.
 
-Run multiple queries IN PARALLEL in one turn (see Parallel Searching rule).
+REQUIRED PARALLEL BATCH (emit all in ONE turn):
+  • web_search "<city> farmers market ${dateContext.todayShort.split(",")[0]} ${new Date(dateContext.nowMs).getFullYear()}"
+  • web_search "<city> food festival ${dateContext.todayShort.split(",")[0]} ${new Date(dateContext.nowMs).getFullYear()}"
+  • web_search "<city> fundraiser this week ${new Date(dateContext.nowMs).getFullYear()}"
+  • web_search "<city> events this weekend site:eventbrite.ca"
+  • web_search "<city> pop up market ${dateContext.todayShort.split(",")[0]} ${new Date(dateContext.nowMs).getFullYear()}"
+
+Adapt the keywords to the user's request (food events → food festivals + farmers
+markets + tastings; family events → kids activities + family-friendly markets;
+etc.) but always batch them in one turn.
+
+ALWAYS INCLUDE THE CURRENT MONTH AND YEAR in your queries:
+  ✓ "Calgary farmers market May 2026"
+  ✗ "Calgary farmers market" (too vague — pulls old indexed pages)
 
 ═══ DATE VERIFICATION CHECK ═══
 For EACH event you're considering, verify:
